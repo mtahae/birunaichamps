@@ -197,17 +197,17 @@ FC_DROPOUT = 0.5
 # =============================================================================
 
 BATCH_SIZE = 32
-LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 1e-4
-NUM_EPOCHS = 80                # Augmentasyon + SWA icin yeterli sure
-EARLY_STOPPING_PATIENCE = 15  # Val F1 15 epoch iyilesmezse dur
+LEARNING_RATE = 3e-4           # Daha dusuk — dengeli veri ile stabil ogrenme
+WEIGHT_DECAY = 5e-4            # Daha guclu L2 — overfitting onleme
+NUM_EPOCHS = 100               # Cosine restart icin yeterli sure
+EARLY_STOPPING_PATIENCE = 20   # Cosine scheduler LR'yi yeniden arttiracak, sabret
 
 # Warmup
-WARMUP_EPOCHS = 5             # Ilk 5 epoch LR lineer olarak artar
+WARMUP_EPOCHS = 5
 
 # Focal Loss
-FOCAL_LOSS_GAMMA = 2.0
-LABEL_SMOOTHING = 0.1         # Overconfidence onleme — soft labels
+FOCAL_LOSS_GAMMA = 1.0         # 2.0'dan dusuruldu — veri artik dengeli
+LABEL_SMOOTHING = 0.05         # 0.1'den dusuruldu — dengeli veri icin daha az gerekli
 
 # Gradient Clipping
 GRAD_CLIP_MAX_NORM = 1.0

@@ -1,28 +1,23 @@
 """
-adim08_egitim.py — BirunAI EKG Siniflandirma: Adim 8 – Egitim (v3)
+adim08_egitim.py — BirunAI EKG Siniflandirma: Adim 8 – Egitim (v4)
 ====================================================================
 
-v3 Iyilestirmeleri (Overfitting + Val Loss Dalgalanmasi):
-    - Augmentasyon: train seti icin time-shift, noise, scaling, lead dropout
-    - SWA (Stochastic Weight Averaging): Val loss dalgalanmasini yumusatir
-    - Warmup(5ep) + ReduceLROnPlateau: LR'yi adaptif dusurmek icin
-    - Label Smoothing (0.1): Overconfidence onleme
-    - Weight Decay (1e-4): Daha guclu regularization
-    - Patience 15: Early stop'a yeterince zaman tan
+v4 Iyilestirmeleri:
+    - Offline Oversampling ile dengelenmis veri seti (Ritim: 378 -> 6280)
+    - Cosine Annealing LR (Warmup sonrasi) — platoda takilmayi onler
+    - Online augmentasyon KAPALI (offline oversampling yeterli)
+    - Label Smoothing dusuruluyor (0.05) — veri artik dengeli
+    - SWA: Son 15 epoch'ta agirlik ortalamalama
+    - WeightedRandomSampler KALDIRILIYOR — veri artik dengeli, sampler gereksiz
+    - Focal Loss gamma dusuruluyor (1.0) — kolay/zor ayrim artik gereksiz
+    - CosineAnnealingWarmRestarts — LR'yi periyodik olarak dusurur/arttirir
 
-Egitim stratejisi:
-    - Focal Loss (gamma=2.0) + sinif agirliklari + label smoothing
-    - WeightedRandomSampler: Her batch'te siniflar dengelenir
-    - AdamW optimizer + Warmup + ReduceLROnPlateau
-    - Gradient Clipping (max_norm=1.0)
-    - Mixed Precision (AMP)
-    - SWA: Son 20 epoch'ta agirlik ortalamalama
-    - Early Stopping: Val Macro F1 bazli
+Hedef: Val F1 > 0.85, Val Loss < 0.3
 
 Ciktilar:
     - outputs/checkpoints/best_model.pth
-    - outputs/checkpoints/swa_model.pth   (SWA modeli)
-    - outputs/training_log.json (dashboard icin)
+    - outputs/checkpoints/swa_model.pth
+    - outputs/training_log.json
 """
 
 import os
@@ -32,7 +27,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, update_bn
 from sklearn.metrics import f1_score
 from datetime import datetime
@@ -80,36 +75,6 @@ def log_bitir(log, status="completed"):
     log["end_time"] = datetime.now().isoformat()
     with open(LOG_PATH, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
-
-
-# =============================================================================
-# WARMUP + REDUCE ON PLATEAU SCHEDULER
-# =============================================================================
-
-class WarmupScheduler:
-    """
-    Ilk warmup_epochs epoch: LR lineer 0 -> base_lr
-    Sonrasi: ReduceLROnPlateau (val F1 plato yaparsa 0.5x dusur)
-    """
-    def __init__(self, optimizer, warmup_epochs, base_lr):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.base_lr = base_lr
-        self.plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
-        )
-
-    def step(self, epoch, val_metric=None):
-        if epoch <= self.warmup_epochs:
-            warmup_lr = self.base_lr * (epoch / self.warmup_epochs)
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = warmup_lr
-        else:
-            if val_metric is not None:
-                self.plateau_scheduler.step(val_metric)
-
-    def get_lr(self):
-        return self.optimizer.param_groups[0]['lr']
 
 
 # =============================================================================
@@ -190,7 +155,7 @@ def validate(model, loader, criterion, device, use_amp):
 
 def egitim_pipeline():
     print("=" * 70)
-    print("BirunAI -- Adim 8: Model Egitimi (v3 — Augmentasyon + SWA)")
+    print("BirunAI -- Adim 8: Model Egitimi (v4 — Dengeli Veri + Cosine LR)")
     print("=" * 70)
 
     # --- Reproducibility ---
@@ -212,33 +177,33 @@ def egitim_pipeline():
     print(f"\n  Veri setleri yukleniyor...")
     sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "segmented_signals")
 
-    # augment=True sadece train icin
+    # Augmentasyon: Sadece online augmentasyon (hafif), offline oversampling zaten yapildi
     train_dataset = EKGDataset(
         os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv"),
         sinyal_dizini,
-        augment=True   # <-- Augmentasyon ACIK
+        augment=True   # Hafif online augmentasyon hala acik (cesiitlilik icin)
     )
     val_dataset = EKGDataset(
         os.path.join(config.PROCESSED_DATA_DIR, "val_manifest.csv"),
         sinyal_dizini,
-        augment=False  # <-- Augmentasyon KAPALI (saf degerlendirme)
+        augment=False
     )
 
+    # Sinif dagilimini goster
+    from collections import Counter
+    sinif_dag = Counter(train_dataset.labels)
     print(f"  Train: {len(train_dataset)} | Val: {len(val_dataset)}")
-    print(f"  Train Augmentasyon: ACIK (time-shift, noise, amplitude, lead-dropout)")
+    for idx in range(config.NUM_CLASSES):
+        print(f"    [{idx}] {config.LABEL_NAMES[idx]:20s}: {sinif_dag.get(idx, 0)}")
 
-    # WeightedRandomSampler
+    # Sinif agirliklari
     class_weights = np.load(os.path.join(config.PROCESSED_DATA_DIR, "class_weights.npy"))
-    sample_weights = [class_weights[label] for label in train_dataset.labels]
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_dataset),
-        replacement=True
-    )
 
+    # DataLoader — artik WeightedRandomSampler gereksiz (veri dengeli)
     train_loader = DataLoader(
         train_dataset, batch_size=config.BATCH_SIZE,
-        sampler=sampler, num_workers=0, pin_memory=(device.type == 'cuda')
+        shuffle=True, num_workers=0, pin_memory=(device.type == 'cuda'),
+        drop_last=True  # Son eksik batch'i at (BN stabilitesi icin)
     )
     val_loader = DataLoader(
         val_dataset, batch_size=config.BATCH_SIZE,
@@ -250,11 +215,10 @@ def egitim_pipeline():
     model = BirunAIModel().to(device)
     model_ozetini_yazdir(model)
 
-    # SWA modeli: Son SWA_START_EPOCH'tan itibaren agirlik ortalamalama
+    # SWA modeli
     swa_model = AveragedModel(model)
-    swa_start_epoch = max(config.NUM_EPOCHS - 20, config.NUM_EPOCHS // 2)
+    swa_start_epoch = max(config.NUM_EPOCHS - 15, config.NUM_EPOCHS // 2)
     swa_aktif = False
-    print(f"  SWA baslangic epoch'u: {swa_start_epoch}")
 
     # --- Loss, Optimizer, Scheduler ---
     criterion = FocalLoss(
@@ -269,23 +233,28 @@ def egitim_pipeline():
         weight_decay=config.WEIGHT_DECAY
     )
 
-    scheduler = WarmupScheduler(
-        optimizer,
-        warmup_epochs=config.WARMUP_EPOCHS,
-        base_lr=config.LEARNING_RATE
+    # CosineAnnealingWarmRestarts:
+    # - Warmup icin ilk 5 epoch'ta LR artarsa, sonra cosine ile duser
+    # - T_0=15: Her 15 epoch'ta bir restart
+    # - T_mult=2: Her restart sonrasi periyot 2x uzar (15, 30, 60...)
+    # - Toplam: Warmup(5) + Cosine(75) = 80 epoch
+    warmup_epochs = config.WARMUP_EPOCHS
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=15, T_mult=2, eta_min=1e-6
     )
 
     scaler = torch.amp.GradScaler() if use_amp else None
 
-    print(f"\n  Egitim Parametreleri (v3):")
+    print(f"\n  Egitim Parametreleri (v4 — Dengeli Veri):")
     print(f"    Optimizer       : AdamW (lr={config.LEARNING_RATE}, wd={config.WEIGHT_DECAY})")
-    print(f"    Scheduler       : Warmup({config.WARMUP_EPOCHS}ep) + ReduceLROnPlateau")
+    print(f"    Scheduler       : Warmup({warmup_epochs}ep) + CosineAnnealingWarmRestarts(T0=15)")
     print(f"    Loss            : FocalLoss(gamma={config.FOCAL_LOSS_GAMMA}, smooth={config.LABEL_SMOOTHING})")
-    print(f"    Augmentasyon    : time-shift, noise, amplitude, lead-dropout (p=0.8)")
-    print(f"    SWA             : epoch {swa_start_epoch}+ (son 20 epoch ortalamalama)")
+    print(f"    Online Augment  : ACIK (hafif)")
+    print(f"    Offline Oversamp: Ritim 378 -> 6280 (Time Shift, Noise, Amplitude)")
+    print(f"    SWA             : epoch {swa_start_epoch}+ (son 15 epoch)")
     print(f"    Batch Size      : {config.BATCH_SIZE}")
     print(f"    Epochs          : {config.NUM_EPOCHS}")
-    print(f"    Early Stop      : {config.EARLY_STOPPING_PATIENCE} epoch")
+    print(f"    Early Stop      : {config.EARLY_STOPPING_PATIENCE} epoch (Val Macro F1)")
     print(f"    Mixed Precision : {'Evet' if use_amp else 'Hayir'}")
 
     # --- Egitim Dongusu ---
@@ -302,8 +271,11 @@ def egitim_pipeline():
     for epoch in range(1, config.NUM_EPOCHS + 1):
         epoch_start = time.time()
 
-        # Warmup adimi (epoch basinda)
-        scheduler.step(epoch, val_metric=None)
+        # Warmup: Ilk 5 epoch LR lineer artis
+        if epoch <= warmup_epochs:
+            warmup_lr = config.LEARNING_RATE * (epoch / warmup_epochs)
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
 
         # Train
         train_loss, train_f1 = train_one_epoch(
@@ -315,19 +287,19 @@ def egitim_pipeline():
             model, val_loader, criterion, device, use_amp
         )
 
-        # Plateau scheduler (warmup sonrasi)
-        if epoch > config.WARMUP_EPOCHS:
-            scheduler.step(epoch, val_metric=val_f1)
+        # Scheduler step (warmup sonrasi)
+        if epoch > warmup_epochs:
+            scheduler.step(epoch - warmup_epochs)
 
-        current_lr = scheduler.get_lr()
+        current_lr = optimizer.param_groups[0]['lr']
         epoch_duration = time.time() - epoch_start
 
-        # SWA — son swa_start_epoch'tan itibaren agirlik topla
+        # SWA
         if epoch >= swa_start_epoch:
             swa_model.update_parameters(model)
             swa_aktif = True
 
-        # Early Stopping
+        # Early Stopping (Val Macro F1 bazli)
         if val_f1 > best_f1:
             best_f1 = val_f1
             patience_counter = 0
@@ -357,14 +329,14 @@ def egitim_pipeline():
             f"{config.LABEL_NAMES[i][:3]}:{val_f1_class[i]:.3f}"
             for i in range(config.NUM_CLASSES)
         )
-        warmup_tag = " [W]" if epoch <= config.WARMUP_EPOCHS else ""
-        swa_tag = " [SWA]" if swa_aktif else ""
+        warmup_tag = " [W]" if epoch <= warmup_epochs else ""
+        swa_tag = " [SWA]" if epoch >= swa_start_epoch else ""
         print(
             f"  E{epoch:3d}/{config.NUM_EPOCHS} | "
             f"TL:{train_loss:.3f} VL:{val_loss:.3f} | "
             f"TF1:{train_f1:.3f} VF1:{val_f1:.3f} | "
             f"{sinif_f1_str} | "
-            f"LR:{current_lr:.5f} ES:{patience_counter}/{config.EARLY_STOPPING_PATIENCE} | "
+            f"LR:{current_lr:.6f} ES:{patience_counter}/{config.EARLY_STOPPING_PATIENCE} | "
             f"{epoch_duration:.1f}s{kayit_durumu}{warmup_tag}{swa_tag}"
         )
 
@@ -372,26 +344,30 @@ def egitim_pipeline():
             print(f"\n  [EARLY STOPPING] {config.EARLY_STOPPING_PATIENCE} epoch iyilesme yok.")
             break
 
-    # --- SWA: BatchNorm istatistiklerini guncelle ---
+    # --- SWA: BatchNorm guncelle ---
     if swa_aktif:
         print(f"\n  SWA BatchNorm guncelleniyor...")
-        train_loader_nobug = DataLoader(
+        bn_loader = DataLoader(
             EKGDataset(
                 os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv"),
                 sinyal_dizini, augment=False
             ),
             batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0
         )
-        update_bn(train_loader_nobug, swa_model, device=device)
+        update_bn(bn_loader, swa_model, device=device)
         torch.save(swa_model.module.state_dict(), swa_checkpoint_path)
         print(f"  SWA modeli kaydedildi: {swa_checkpoint_path}")
 
-        # SWA ile de val degerlendirmesi yap
+        # SWA degerlendir
         swa_model.to(device)
         _, swa_f1, swa_f1_class = validate(swa_model, val_loader, criterion, device, use_amp)
         print(f"  SWA Val F1: {swa_f1:.4f} vs Best Val F1: {best_f1:.4f}")
+        swa_class_str = " | ".join(
+            f"{config.LABEL_NAMES[i][:3]}:{swa_f1_class[i]:.3f}"
+            for i in range(config.NUM_CLASSES)
+        )
+        print(f"  SWA sinif F1: {swa_class_str}")
 
-        # SWA daha iyi ise best_model olarak kaydet
         if swa_f1 > best_f1:
             torch.save(swa_model.module.state_dict(), checkpoint_path)
             print(f"  SWA modeli daha iyi! best_model.pth guncellendi.")
@@ -410,10 +386,6 @@ def egitim_pipeline():
 
     return {"best_f1": best_f1, "total_epochs": epoch}
 
-
-# =============================================================================
-# ANA CALISTIRMA
-# =============================================================================
 
 if __name__ == "__main__":
     sonuc = egitim_pipeline()

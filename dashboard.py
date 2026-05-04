@@ -266,7 +266,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="card-title">⏱ Early Stopping Sayacı</div>
       <div class="es-indicator" id="esIndicator"></div>
       <p style="font-size:12px; color:#6b7280; margin-top:12px;" id="esText">
-        Patience: 0 / 10
+        Patience: 0 / 20
       </p>
     </div>
   </div>
@@ -311,7 +311,7 @@ const f1Chart = new Chart(document.getElementById('f1Chart'), {
 
 // ES dots
 const esContainer = document.getElementById('esIndicator');
-for (let i = 0; i < 15; i++) {
+for (let i = 0; i < 20; i++) {
   const dot = document.createElement('div');
   dot.className = 'es-dot';
   dot.textContent = i + 1;
@@ -378,7 +378,7 @@ function updateDashboard(data) {
 
   // Early Stopping
   const dots = esContainer.children;
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 20; i++) {
     if (i < last.patience_counter) {
       dots[i].className = 'es-dot active';
     } else {
@@ -386,9 +386,9 @@ function updateDashboard(data) {
     }
   }
   document.getElementById('esText').textContent =
-    'Patience: ' + last.patience_counter + ' / 10 — ' +
-    (last.patience_counter >= 8 ? '⚠️ Durma yakın!' :
-     last.patience_counter >= 5 ? '🟡 Dikkat' : '🟢 Stabil');
+    'Patience: ' + last.patience_counter + ' / 20 — ' +
+    (last.patience_counter >= 16 ? '⚠️ Durma yakın!' :
+     last.patience_counter >= 10 ? '🟡 Dikkat' : '🟢 Stabil');
 }
 
 // 2 saniyede bir guncelle
