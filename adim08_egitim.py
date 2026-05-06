@@ -177,11 +177,17 @@ def egitim_pipeline():
     print(f"\n  Veri setleri yukleniyor...")
     sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "segmented_signals")
 
-    # Augmentasyon: Sadece online augmentasyon (hafif), offline oversampling zaten yapildi
+    # SMOTE sonrasi manifest (Ritim sinifi dengelenmis)
+    train_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest_smote.csv")
+    if not os.path.exists(train_manifest):
+        # Fallback: SMOTE yapilmamissa normal manifest
+        train_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv")
+        print(f"  [UYARI] SMOTE manifest bulunamadi, orijinal kullaniliyor.")
+
     train_dataset = EKGDataset(
-        os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv"),
+        train_manifest,
         sinyal_dizini,
-        augment=True   # Hafif online augmentasyon hala acik (cesiitlilik icin)
+        augment=True   # Hafif online augmentasyon (cesitlilik icin)
     )
     val_dataset = EKGDataset(
         os.path.join(config.PROCESSED_DATA_DIR, "val_manifest.csv"),
@@ -199,15 +205,16 @@ def egitim_pipeline():
     # Sinif agirliklari
     class_weights = np.load(os.path.join(config.PROCESSED_DATA_DIR, "class_weights.npy"))
 
-    # DataLoader — artik WeightedRandomSampler gereksiz (veri dengeli)
+    # DataLoader — SMOTE sonrasi veri dengeli, sampler gereksiz
     train_loader = DataLoader(
         train_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=True, num_workers=0, pin_memory=(device.type == 'cuda'),
-        drop_last=True  # Son eksik batch'i at (BN stabilitesi icin)
+        shuffle=True, num_workers=2, pin_memory=(device.type == 'cuda'),
+        drop_last=True, persistent_workers=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=0, pin_memory=(device.type == 'cuda')
+        shuffle=False, num_workers=2, pin_memory=(device.type == 'cuda'),
+        persistent_workers=True
     )
 
     # --- Model ---

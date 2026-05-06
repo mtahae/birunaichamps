@@ -409,7 +409,20 @@ fetchData();
 
 @app.route('/')
 def index():
-    return Response(DASHBOARD_HTML, mimetype='text/html')
+    # Patience ve epoch degerlerini config'den oku, HTML icine enjekte et
+    patience = config.EARLY_STOPPING_PATIENCE
+    html = DASHBOARD_HTML
+    html = html.replace('Patience: 0 / 20', f'Patience: 0 / {patience}')
+    html = html.replace('for (let i = 0; i < 20; i++)', f'for (let i = 0; i < {patience}; i++)')
+    html = html.replace(
+        "const dots = esContainer.children;\n  for (let i = 0; i < 20; i++)",
+        f"const dots = esContainer.children;\n  const MAX_PATIENCE = {patience};\n  const warn_high = Math.ceil(MAX_PATIENCE * 0.8);\n  const warn_mid  = Math.ceil(MAX_PATIENCE * 0.5);\n  for (let i = 0; i < MAX_PATIENCE; i++)"
+    )
+    html = html.replace(
+        "'Patience: ' + last.patience_counter + ' / 20 \u2014 ' +\n    (last.patience_counter >= 16 ? '\u26a0\ufe0f Durma yak\u0131n!' :\n     last.patience_counter >= 10 ? '\U0001f7e1 Dikkat' : '\U0001f7e2 Stabil')",
+        f"'Patience: ' + last.patience_counter + ' / {patience} \u2014 ' +\n    (last.patience_counter >= warn_high ? '\u26a0\ufe0f Durma yak\u0131n!' :\n     last.patience_counter >= warn_mid  ? '\U0001f7e1 Dikkat' : '\U0001f7e2 Stabil')"
+    )
+    return Response(html, mimetype='text/html')
 
 
 @app.route('/api/status')

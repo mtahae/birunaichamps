@@ -1,16 +1,23 @@
 """
-baslat.py — BirunAI EKG Siniflandirma: Tek Tikla Baslatici
-=============================================================
+baslat.py — BirunAI EKG Siniflandirma: Tek Tikla Baslatici (Multi-Dataset v5)
+================================================================================
 
-Bu script su adimlari sirayla calistirir:
-    1. GPU kontrolu
-    2. Dashboard'u arka planda baslat
-    3. Model egitimi (Adim 8)
-    4. Test degerlendirmesi (Adim 9)
-    5. GradCAM uretimi (Adim 10)
+Bu script tum pipeline'i sirayla calistirir:
+    Adim 0: Veri Birlestirme (5 dataset -> unified_manifest.csv)
+    Adim 1: Genel Kalite Kontrol (mukerrer tespiti + sinyal dogrulama)
+    Adim 2: Filtreleme ve Alt Ornekleme (500 Hz -> 250 Hz, bandpass)
+    Adim 3: Sinyal Kalite Kontrol (flat-line, clipping)
+    Adim 4: Segmentasyon (-> 12x2500)
+    Adim 6: Veri Bolme (Train/Val/Test)
+    Adim 6b: SMOTE Oversampling (Ritim sinifi dengeleme)
+    Adim 8: Model Egitimi
+    Adim 9: Test Degerlendirmesi
+    Adim 10: GradCAM
 
 Kullanim:
-    python baslat.py
+    python baslat.py                  # Tum pipeline
+    python baslat.py --sadece-egitim  # Sadece egitim (veri islem adimlarini atla)
+
 """
 
 import os
@@ -42,27 +49,93 @@ def gpu_kontrol():
         else:
             print(f"\n  [UYARI] GPU bulunamadi!")
             print(f"  CPU ile egitim yapilacak (yavas olabilir).")
-            print(f"  GPU icin: pip install torch --index-url https://download.pytorch.org/whl/cu121")
 
         return True
 
     except ImportError:
         print("\n  [HATA] PyTorch kurulu degil!")
-        print("  Kurulum: pip install torch torchvision")
         return False
+
+
+def veri_isleme_adimlari():
+    """Adim 0-6b: Veri isleme pipeline'i."""
+
+    # Adim 0: Birlestirme
+    print(f"\n{'='*70}")
+    print("  Adim 0: Multi-Dataset Birlestirme")
+    print(f"{'='*70}\n")
+    from adim00_veri_birlestirme import birlestirme_pipeline
+    birlestirme_pipeline()
+
+    # Adim 1: Genel QC
+    print(f"\n{'='*70}")
+    print("  Adim 1: Genel Kalite Kontrol")
+    print(f"{'='*70}\n")
+    from adim01_kalite_kontrol_genel import kalite_kontrol_genel
+    kalite_kontrol_genel()
+
+    # Adim 2: Filtreleme
+    print(f"\n{'='*70}")
+    print("  Adim 2: Filtreleme ve Alt Ornekleme")
+    print(f"{'='*70}\n")
+    from adim02_filtreleme import filtreleme_pipeline
+    filtreleme_pipeline()
+
+    # Adim 3: Sinyal QC
+    print(f"\n{'='*70}")
+    print("  Adim 3: Sinyal Kalite Kontrol")
+    print(f"{'='*70}\n")
+    from adim03_kalite_kontrol import kalite_kontrol_pipeline
+    kalite_kontrol_pipeline()
+
+    # Adim 4: Segmentasyon
+    print(f"\n{'='*70}")
+    print("  Adim 4: Segmentasyon")
+    print(f"{'='*70}\n")
+    from adim04_segmentasyon import segmentasyon_pipeline
+    segmentasyon_pipeline()
+
+    # Adim 6: Veri Bolme
+    print(f"\n{'='*70}")
+    print("  Adim 6: Veri Bolme (Train/Val/Test)")
+    print(f"{'='*70}\n")
+    from adim06_veri_bolme import veri_bolme_pipeline
+    veri_bolme_pipeline()
+
+    # Adim 6b: SMOTE
+    print(f"\n{'='*70}")
+    print("  Adim 6b: SMOTE Oversampling")
+    print(f"{'='*70}\n")
+    from adim06b_oversampling import smote_pipeline
+    smote_pipeline()
 
 
 def main():
     """Ana baslatma fonksiyonu."""
     print("\n" + "=" * 70)
-    print("  ⚡ BirunAI EKG Siniflandirma — Egitim Pipeline")
+    print("  BirunAI EKG Siniflandirma -- Multi-Dataset Pipeline v5")
     print("=" * 70)
 
     # 1. GPU kontrol
     if not gpu_kontrol():
         return
 
-    # 2. Dashboard baslat
+    # Komut satiri argumanlari
+    sadece_egitim = "--sadece-egitim" in sys.argv
+
+    # 2. Veri isleme (eger gerekiyorsa)
+    if not sadece_egitim:
+        veri_isleme_adimlari()
+    else:
+        print(f"\n  [BILGI] --sadece-egitim modunda. Veri adimları atlaniyor.")
+        # SMOTE manifest kontrol
+        smote_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest_smote.csv")
+        normal_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv")
+        if not os.path.exists(smote_manifest) and not os.path.exists(normal_manifest):
+            print("  [HATA] Egitim manifesti bulunamadi! Once veri isleme adimlari calistirilmali.")
+            return
+
+    # 3. Dashboard baslat
     print(f"\n{'='*70}")
     print("  Dashboard baslatiliyor...")
     print(f"{'='*70}")
@@ -77,25 +150,25 @@ def main():
         print(f"  [UYARI] Dashboard baslatilamadi: {e}")
         print(f"  Egitim dashboard'suz devam edecek.")
 
-    # 3. Egitim
+    # 4. Egitim
     print(f"\n{'='*70}")
-    print("  Model egitimi basliyor...")
+    print("  Adim 8: Model Egitimi")
     print(f"{'='*70}\n")
 
     from adim08_egitim import egitim_pipeline
     egitim_sonuc = egitim_pipeline()
 
-    # 4. Degerlendirme
+    # 5. Degerlendirme
     print(f"\n{'='*70}")
-    print("  Test degerlendirmesi basliyor...")
+    print("  Adim 9: Test Degerlendirmesi")
     print(f"{'='*70}\n")
 
     from adim09_degerlendirme import degerlendirme_pipeline
     metrikler = degerlendirme_pipeline()
 
-    # 5. GradCAM
+    # 6. GradCAM
     print(f"\n{'='*70}")
-    print("  GradCAM uretimi basliyor...")
+    print("  Adim 10: GradCAM Uretimi")
     print(f"{'='*70}\n")
 
     from adim10_gradcam import gradcam_pipeline

@@ -1,18 +1,16 @@
 """
-adim04_segmentasyon.py — BirunAI EKG Siniflandirma: Adim 4 – Segmentasyon
-==========================================================================
+adim04_segmentasyon.py — BirunAI EKG: Adim 4 – Segmentasyon
+=============================================================
 
-Bu modul, filtrelenmis EKG sinyallerini sabit uzunlukta pencerelere boler.
+Bu modul, filtrelenmis sinyalleri sabit 10-sn pencereye (2500 ornek @ 250 Hz)
+standardize eder.
 
-Projemizde belirttigimiz gibi:
-    - 10 saniye sabit pencere: Klinik 12-lead EKG standardi ile uyumlu.
-    - 250 Hz x 10 sn = 2500 zaman adimi.
-    - PTB-XL kayitlari zaten 10 sn oldugundan, cogu kayit direkt kullanilir.
-    - Kisa kayitlar: Sifir-padding (zero-pad) uygulanir.
-    - Uzun kayitlar: Ortadan kirpilir (center-crop).
+Strateji:
+    - Uzun sinyaller: Merkez crop
+    - Kisa sinyaller: Simetrik zero-padding
 
 Ciktilar:
-    - outputs/processed_data/segmented_signals/  (her kayit icin .npy dosyasi)
+    - outputs/processed_data/segmented_signals/   (her kayit icin .npy)
     - outputs/processed_data/segmented_manifest.csv
 
 Kullanim:
@@ -25,202 +23,124 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# Proje kok dizinini Python path'e ekle
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 
-# =============================================================================
-# SEGMENTASYON FONKSIYONLARI
-# =============================================================================
-
-def sabit_pencere_uygula(sinyal_2d, hedef_uzunluk=None):
+def segment_sinyal(sinyal_2d, hedef_uzunluk=None):
     """
-    Sinyali sabit uzunlukta pencereye uyarlar.
-
-    Projemizde belirttigimiz gibi:
-    - Hedef uzunluk: 2500 ornek (10 sn @ 250 Hz)
-    - Kisa sinyaller: Sona sifir-padding eklenir.
-    - Uzun sinyaller: Bastan ve sondan esit olarak kirpilir (center-crop).
-    - Tam uzunlukta sinyaller: Olduklari gibi korunur.
+    Tek bir sinyali hedef uzunluga getirir.
 
     Args:
-        sinyal_2d: (kanal_sayisi, zaman_adimi) formatinda numpy array
-        hedef_uzunluk: Hedef zaman adimi sayisi. Varsayilan: config.TARGET_LENGTH
+        sinyal_2d: np.ndarray (12, N)
+        hedef_uzunluk: int — default config.TARGET_LENGTH
 
     Returns:
-        numpy array: (kanal_sayisi, hedef_uzunluk) formatinda numpy array
+        np.ndarray (12, hedef_uzunluk)
     """
     if hedef_uzunluk is None:
         hedef_uzunluk = config.TARGET_LENGTH
 
-    kanal_sayisi = sinyal_2d.shape[0]
-    mevcut_uzunluk = sinyal_2d.shape[1]
+    mevcut = sinyal_2d.shape[1]
 
-    if mevcut_uzunluk == hedef_uzunluk:
-        # Tam uyum — olduklari gibi don
+    if mevcut == hedef_uzunluk:
         return sinyal_2d
 
-    elif mevcut_uzunluk < hedef_uzunluk:
-        # KISA sinyal — sifir-padding
-        padded = np.zeros((kanal_sayisi, hedef_uzunluk), dtype=sinyal_2d.dtype)
-        padded[:, :mevcut_uzunluk] = sinyal_2d
-        return padded
-
-    else:
-        # UZUN sinyal — center-crop
-        baslangic = (mevcut_uzunluk - hedef_uzunluk) // 2
+    elif mevcut > hedef_uzunluk:
+        # Merkez crop
+        baslangic = (mevcut - hedef_uzunluk) // 2
         return sinyal_2d[:, baslangic:baslangic + hedef_uzunluk]
 
+    else:
+        # Simetrik zero-padding
+        sonuc = np.zeros((sinyal_2d.shape[0], hedef_uzunluk), dtype=sinyal_2d.dtype)
+        pad = (hedef_uzunluk - mevcut) // 2
+        sonuc[:, pad:pad + mevcut] = sinyal_2d
+        return sonuc
 
-# =============================================================================
-# ANA SEGMENTASYON PIPELINE'I
-# =============================================================================
 
 def segmentasyon_pipeline():
-    """
-    QC'den gecen tum sinyallere segmentasyon uygular.
-
-    Islem Akisi:
-        1. quality_manifest.csv okunur.
-        2. Sadece qc_pass=True olan kayitlar secilir.
-        3. Her kayit icin sabit pencere uygulanir.
-        4. Segmente edilmis sinyaller .npy olarak kaydedilir.
-        5. segmented_manifest.csv kaydedilir.
-
-    Returns:
-        pd.DataFrame: Segmente edilmis manifest.
-    """
     print("=" * 70)
-    print("BirunAI -- Adim 4: Segmentasyon (10sn Sabit Pencere)")
+    print("BirunAI — Adim 4: Segmentasyon")
     print("=" * 70)
 
-    # --- 1. Manifest oku ---
     manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "quality_manifest.csv")
     print(f"\n[1/3] quality_manifest.csv okunuyor...")
 
     if not os.path.exists(manifest_yolu):
-        raise FileNotFoundError(
-            f"quality_manifest.csv bulunamadi: {manifest_yolu}\n"
-            "Once adim03_kalite_kontrol.py calistirilmali."
-        )
+        raise FileNotFoundError(f"Bulunamadi: {manifest_yolu}")
 
-    df = pd.read_csv(manifest_yolu, index_col="ecg_id")
-    gecerli = df[df["qc_pass"] == True].copy()
-    print(f"      QC gecen kayit: {len(gecerli)}")
+    df = pd.read_csv(manifest_yolu)
+    gecen = df[df['qc_pass'] == True].copy()
+    print(f"      QC gecen kayit: {len(gecen)}")
 
-    # --- 2. Cikti dizinini olustur ---
-    kaynak_dizini = os.path.join(config.PROCESSED_DATA_DIR, "filtered_signals")
+    sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "filtered_signals")
     cikti_dizini = os.path.join(config.PROCESSED_DATA_DIR, "segmented_signals")
     os.makedirs(cikti_dizini, exist_ok=True)
 
-    # --- 3. Segmentasyon dongusu ---
-    print(f"\n[2/3] Segmentasyon uygulanyor...")
-    print(f"      Hedef uzunluk : {config.TARGET_LENGTH} ornek")
-    print(f"      = {config.WINDOW_SEC} saniye @ {config.TARGET_FS} Hz")
+    print(f"\n[2/3] Segmentasyon uygulanıyor...")
+    print(f"      Hedef: ({config.NUM_LEADS}, {config.TARGET_LENGTH})\n")
 
     basarili = 0
-    padded_sayisi = 0
-    cropped_sayisi = 0
-    tam_sayisi = 0
-    hatali = 0
+    basarisiz = 0
+    istatistikler = {'crop': 0, 'pad': 0, 'exact': 0}
 
-    for ecg_id, satir in tqdm(gecerli.iterrows(), total=len(gecerli),
-                               desc="      Segmentasyon"):
+    for idx, row in tqdm(gecen.iterrows(), total=len(gecen),
+                          desc="      Segmentasyon", ncols=80):
+        ecg_id = row['ecg_id']
+        giris_dosyasi = os.path.join(sinyal_dizini, f"{ecg_id}.npy")
+
         try:
-            # Sinyal yukle
-            sinyal_dosyasi = os.path.join(kaynak_dizini, f"{ecg_id}.npy")
-            sinyal = np.load(sinyal_dosyasi)
+            sinyal = np.load(giris_dosyasi)
 
-            orijinal_uzunluk = sinyal.shape[1]
-
-            # Sabit pencere uygula
-            segmente = sabit_pencere_uygula(sinyal)
-
-            # Istatistik
-            if orijinal_uzunluk == config.TARGET_LENGTH:
-                tam_sayisi += 1
-            elif orijinal_uzunluk < config.TARGET_LENGTH:
-                padded_sayisi += 1
+            if sinyal.shape[1] > config.TARGET_LENGTH:
+                istatistikler['crop'] += 1
+            elif sinyal.shape[1] < config.TARGET_LENGTH:
+                istatistikler['pad'] += 1
             else:
-                cropped_sayisi += 1
+                istatistikler['exact'] += 1
 
-            # Kaydet
+            sinyal_seg = segment_sinyal(sinyal)
+            assert sinyal_seg.shape == (config.NUM_LEADS, config.TARGET_LENGTH)
+
             cikti_dosyasi = os.path.join(cikti_dizini, f"{ecg_id}.npy")
-            np.save(cikti_dosyasi, segmente.astype(np.float32))
-
+            np.save(cikti_dosyasi, sinyal_seg.astype(np.float32))
             basarili += 1
 
         except Exception as e:
-            hatali += 1
+            basarisiz += 1
 
-    print(f"\n      Basarili     : {basarili}")
-    print(f"      Hatali       : {hatali}")
-    print(f"      Tam uzunluk  : {tam_sayisi}")
-    print(f"      Padding      : {padded_sayisi}")
-    print(f"      Cropping     : {cropped_sayisi}")
+    print(f"\n      Basarili : {basarili}")
+    print(f"      Basarisiz: {basarisiz}")
+    print(f"      Crop     : {istatistikler['crop']}")
+    print(f"      Pad      : {istatistikler['pad']}")
+    print(f"      Exact    : {istatistikler['exact']}")
 
-    # --- 4. Segmente manifest ---
+    # Manifest kaydet
     print(f"\n[3/3] segmented_manifest.csv kaydediliyor...")
-
-    # Basarili kayitlari isaretmek
     basarili_ids = set()
-    for ecg_id in gecerli.index:
-        cikti_dosyasi = os.path.join(cikti_dizini, f"{ecg_id}.npy")
-        if os.path.exists(cikti_dosyasi):
+    for ecg_id in gecen['ecg_id']:
+        if os.path.exists(os.path.join(cikti_dizini, f"{ecg_id}.npy")):
             basarili_ids.add(ecg_id)
 
-    gecerli["segmented"] = gecerli.index.isin(basarili_ids)
-    gecerli["segmented_path"] = gecerli.index.map(
-        lambda x: os.path.join("segmented_signals", f"{x}.npy") if x in basarili_ids else None
-    )
+    gecen['segmented'] = gecen['ecg_id'].isin(basarili_ids)
+    sonuc = gecen[gecen['segmented'] == True].copy()
 
-    cikti_yolu = os.path.join(config.PROCESSED_DATA_DIR, "segmented_manifest.csv")
-    gecerli.to_csv(cikti_yolu)
-    print(f"      Kaydedildi: {cikti_yolu}")
+    manifest_cikti = os.path.join(config.PROCESSED_DATA_DIR, "segmented_manifest.csv")
+    sonuc.to_csv(manifest_cikti, index=False)
+    print(f"      Kaydedildi: {manifest_cikti}")
+    print(f"      Toplam segmentlenmis: {len(sonuc)}")
 
-    # --- Ozet ---
-    print("\n" + "=" * 70)
-    print("OZET ISTATISTIKLER")
-    print("=" * 70)
-
-    segmente_kayitlar = gecerli[gecerli["segmented"] == True]
-    print(f"  Toplam segmente edilen : {len(segmente_kayitlar)}")
-    print(f"  Sinyal boyutu          : ({config.NUM_LEADS}, {config.TARGET_LENGTH})")
-
-    # Sinif dagilimi
-    sinif_dag = segmente_kayitlar["label"].value_counts().sort_index()
+    sinif_dag = sonuc['label'].value_counts().sort_index()
     print(f"\n  Sinif Dagilimi:")
-    for sinif_idx, sayi in sinif_dag.items():
-        sinif_adi = config.LABEL_NAMES.get(int(sinif_idx), "Bilinmeyen")
-        oran = sayi / sinif_dag.sum() * 100
-        print(f"    [{int(sinif_idx)}] {sinif_adi:20s}: {sayi:6d} ({oran:5.1f}%)")
-
-    # Ornek sinyal dogrulama
-    ornek_dosya = os.path.join(cikti_dizini, f"{segmente_kayitlar.index[0]}.npy")
-    if os.path.exists(ornek_dosya):
-        ornek = np.load(ornek_dosya)
-        print(f"\n  Ornek sinyal shape  : {ornek.shape}")
-        print(f"  Ornek sinyal dtype  : {ornek.dtype}")
-
-    # Disk kullanimi
-    toplam_boyut_mb = 0
-    for f in os.listdir(cikti_dizini):
-        if f.endswith(".npy"):
-            toplam_boyut_mb += os.path.getsize(os.path.join(cikti_dizini, f))
-    toplam_boyut_mb /= (1024 * 1024)
-    print(f"\n  Toplam disk kullanimi  : {toplam_boyut_mb:.1f} MB")
+    for s, n in sinif_dag.items():
+        print(f"    [{int(s)}] {config.LABEL_NAMES.get(int(s),'?'):20s}: {n:6d} ({n/sinif_dag.sum()*100:5.1f}%)")
 
     print("\n" + "=" * 70)
-    print("Adim 4 tamamlandi. Sonraki adim: adim05_ozellik_cikarma.py")
+    print("Adim 4 tamamlandi. Sonraki: adim06_veri_bolme.py")
     print("=" * 70)
+    return sonuc
 
-    return gecerli
-
-
-# =============================================================================
-# ANA CALISTIRMA
-# =============================================================================
 
 if __name__ == "__main__":
-    sonuc = segmentasyon_pipeline()
+    segmentasyon_pipeline()

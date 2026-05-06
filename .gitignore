@@ -1,4 +1,5 @@
 ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/
+datasets/*
 env/
 __pycache__/
 *.pyc
