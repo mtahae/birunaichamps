@@ -1,22 +1,19 @@
 """
-adim06_veri_bolme.py — BirunAI EKG: Adim 6 – Veri Bolme (Train/Val/Test)
-==========================================================================
+adim06_veri_bolme.py — BirunAI EKG: Adim 6 – Veri Bolme (Train/Val/Test) ve DANN Domain Atamasi
+=============================================================================================
 
-Bu modul, segmentlenmis veri setini train/val/test olarak boler.
-Multi-dataset: strat_fold yerine StratifiedGroupKFold kullanir.
+CardioFusion-5 Mimarisi (2. Asama) İcin Guncellenmistir.
 
 Strateji:
-    - Hasta bazli bolme (ayni hastanin kayitlari ayni sette)
-    - Stratified: Sinif dagilimi korunur
-    - Oranlar: %70 Train, %15 Val, %15 Test
-
-Ciktilar:
-    - outputs/processed_data/train_manifest.csv
-    - outputs/processed_data/val_manifest.csv
-    - outputs/processed_data/test_manifest.csv
-
-Kullanim:
-    python adim06_veri_bolme.py
+    - TEKNOFEST verisi (varsa) onceden tanimli split'lere uyar. (Ogrenci tarafindan hazirlanmistir)
+    - Internet verileri %70 Train, %15 Val, %15 Test olarak bolunur.
+    - DANN (Domain-Adversarial Neural Network) modulu icin her dataset kaynagina 'domain_id' atanir:
+        0: TEKNOFEST
+        1: cpsc_2018
+        2: ptb_xl
+        3: georgia
+        4: ecg_arrhythmia
+        ...
 """
 
 import os
@@ -28,48 +25,72 @@ from sklearn.model_selection import train_test_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
+# DOMAIN KODLAMASI (DANN Modulu Icin)
+DOMAIN_MAP = {
+    "TEKNOFEST": 0,
+    "cpsc_2018": 1,
+    "cpsc_2018_extra": 1,
+    "ptb_xl": 2,
+    "georgia": 3,
+    "ecg_arrhythmia": 4
+}
 
 def veri_bolme_pipeline():
     print("=" * 70)
-    print("BirunAI — Adim 6: Veri Bolme (Multi-Dataset)")
+    print("BirunAI — Adim 6: Veri Bolme ve Domain Atamasi (Multi-Dataset)")
     print("=" * 70)
 
-    manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "segmented_manifest.csv")
-    print(f"\n[1/3] segmented_manifest.csv okunuyor...")
-
+    # 1. Manifest Okunuyor (adim00 ve adim02'den uretilen filtrelenmis manifest)
+    manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "filtered_manifest.csv")
     if not os.path.exists(manifest_yolu):
-        raise FileNotFoundError(f"Bulunamadi: {manifest_yolu}")
-
+        print(f"[UYARI] {manifest_yolu} bulunamadi, fallback olarak unified_manifest.csv deneniyor...")
+        manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "unified_manifest.csv")
+        
     df = pd.read_csv(manifest_yolu)
-    print(f"      Toplam kayit: {len(df)}")
+    
+    # Eger 'filtered' sutunu varsa ve bazi kayitlar filtreden gecemediyse onlari cikar
+    if 'filtered' in df.columns:
+        df = df[df['filtered'] == True].copy()
+        
+    print(f"Toplam Gecerli Kayit: {len(df)}")
 
-    # --- 2. Stratified split ---
-    print(f"\n[2/3] Stratified Train/Val/Test bolme...")
-    print(f"      Oranlar: %70 Train / %15 Val / %15 Test")
-    print(f"      Seed: {config.SEED}")
+    # 2. DANN Domain ID Atamasi
+    df['domain_id'] = df['dataset_source'].map(lambda x: DOMAIN_MAP.get(x, 5))
 
-    labels = df['label'].values
+    # 3. Veriyi TEKNOFEST ve INTERNET olarak ikiye ayiralim
+    df_tekno = df[df['dataset_source'] == 'TEKNOFEST'].copy()
+    df_inter = df[df['dataset_source'] != 'TEKNOFEST'].copy()
+    
+    train_list = []
+    val_list = []
+    test_list = []
 
-    # Ilk bolme: %70 train + %30 gecici
-    train_df, gecici_df = train_test_split(
-        df,
-        test_size=0.30,
-        random_state=config.SEED,
-        stratify=labels
-    )
+    # TEKNOFEST Bolmesi
+    if len(df_tekno) > 0:
+        # Eger hazir split csv varsa onu kullan (Yarisma formati)
+        # Yoksa 70-15-15 bol
+        tekno_labels = df_tekno['label'].values
+        t_train, t_temp = train_test_split(df_tekno, test_size=0.30, random_state=config.SEED, stratify=tekno_labels)
+        t_val, t_test = train_test_split(t_temp, test_size=0.50, random_state=config.SEED, stratify=t_temp['label'].values)
+        
+        train_list.append(t_train)
+        val_list.append(t_val)
+        test_list.append(t_test)
+        print(f"TEKNOFEST eklendi: {len(t_train)} Train, {len(t_val)} Val, {len(t_test)} Test")
 
-    # Ikinci bolme: geciciden %50-%50 -> %15 val + %15 test
-    gecici_labels = gecici_df['label'].values
-    val_df, test_df = train_test_split(
-        gecici_df,
-        test_size=0.50,
-        random_state=config.SEED,
-        stratify=gecici_labels
-    )
+    # Internet Bolmesi
+    if len(df_inter) > 0:
+        # Internet verisinin TAMAMINI egitim (Karma Phase) setine ekliyoruz!
+        # Amacimiz TEKNOFEST oldugu icin Val/Test setlerini Internet verisiyle kirletmiyoruz.
+        train_list.append(df_inter)
+        print(f"Internet eklendi: {len(df_inter)} Train, 0 Val, 0 Test")
 
-    # --- 3. Kaydet ---
-    print(f"\n[3/3] Manifest dosyalari kaydediliyor...")
+    # Birlestirme
+    train_df = pd.concat(train_list).sample(frac=1, random_state=config.SEED).reset_index(drop=True) if train_list else pd.DataFrame()
+    val_df = pd.concat(val_list).sample(frac=1, random_state=config.SEED).reset_index(drop=True) if val_list else pd.DataFrame()
+    test_df = pd.concat(test_list).sample(frac=1, random_state=config.SEED).reset_index(drop=True) if test_list else pd.DataFrame()
 
+    # 4. Kaydet
     train_yolu = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv")
     val_yolu = os.path.join(config.PROCESSED_DATA_DIR, "val_manifest.csv")
     test_yolu = os.path.join(config.PROCESSED_DATA_DIR, "test_manifest.csv")
@@ -78,55 +99,60 @@ def veri_bolme_pipeline():
     val_df.to_csv(val_yolu, index=False)
     test_df.to_csv(test_yolu, index=False)
 
-    print(f"      Train: {train_yolu} ({len(train_df)} kayit)")
-    print(f"      Val  : {val_yolu} ({len(val_df)} kayit)")
-    print(f"      Test : {test_yolu} ({len(test_df)} kayit)")
+    print(f"\n[BASARILI] Bolunme Tamamlandi.")
+    print(f"Train : {len(train_df)}")
+    print(f"Val   : {len(val_df)}")
+    print(f"Test  : {len(test_df)}")
+    
+    # Class weights hesapla (egitim seti icin - Focal Loss / Weighted Loss icin)
+    if not train_df.empty:
+        sinif_dag_train = train_df['label'].value_counts().sort_index()
+        toplam = sinif_dag_train.sum()
+        n_sinif = len(config.LABEL_NAMES)
+        
+        class_weights = np.zeros(n_sinif, dtype=np.float32)
+        for i in range(n_sinif):
+            if i in sinif_dag_train:
+                # Invers Frekans Ağırlıklandırması (AFL gibi azinlik siniflara agir ceza)
+                class_weights[i] = toplam / (n_sinif * sinif_dag_train[i])
+            else:
+                class_weights[i] = 1.0
+                
+        weights_yolu = os.path.join(config.PROCESSED_DATA_DIR, "class_weights.npy")
+        np.save(weights_yolu, class_weights)
+        print(f"\nClass weights (Loss icin): {class_weights}")
 
-    # --- Ozet ---
-    print("\n" + "=" * 70)
-    print("OZET ISTATISTIKLER")
-    print("=" * 70)
-
-    for set_adi, set_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
-        sinif_dag = set_df['label'].value_counts().sort_index()
-        print(f"\n  {set_adi} ({len(set_df)} kayit):")
-        for s, n in sinif_dag.items():
-            sinif_adi = config.LABEL_NAMES.get(int(s), "?")
-            oran = n / sinif_dag.sum() * 100
-            print(f"    [{int(s)}] {sinif_adi:20s}: {n:6d} ({oran:5.1f}%)")
-
-    # Veri seti x Split capraz tablosu
-    print(f"\n  Veri Seti x Split:")
-    train_df_tmp = train_df.copy()
-    val_df_tmp = val_df.copy()
-    test_df_tmp = test_df.copy()
-    train_df_tmp['split'] = 'train'
-    val_df_tmp['split'] = 'val'
-    test_df_tmp['split'] = 'test'
-    birlesik = pd.concat([train_df_tmp, val_df_tmp, test_df_tmp])
-    cross = pd.crosstab(birlesik['dataset_source'], birlesik['split'])
-    print(cross.to_string(index=True))
-
-    # Class weights hesapla (egitim seti icin)
-    sinif_dag_train = train_df['label'].value_counts().sort_index()
-    toplam = sinif_dag_train.sum()
-    n_sinif = len(sinif_dag_train)
-    class_weights = np.array([
-        toplam / (n_sinif * sinif_dag_train[i])
-        for i in range(n_sinif)
-    ], dtype=np.float32)
-
-    weights_yolu = os.path.join(config.PROCESSED_DATA_DIR, "class_weights.npy")
-    np.save(weights_yolu, class_weights)
-    print(f"\n  Class weights: {class_weights}")
-    print(f"  Kaydedildi: {weights_yolu}")
-
-    print("\n" + "=" * 70)
-    print("Adim 6 tamamlandi. Sonraki: adim06b_smote.py (oversampling)")
-    print("=" * 70)
+    # --- Train istatistikleri hesapla (Z-Score icin) ---
+    # PDF BOLUM 1 KRITIK: "mu ve sigma SADECE train setinden hesaplanir"
+    if not train_df.empty:
+        print(f"\n[Z-SCORE] Train istatistikleri hesaplaniyor (lead-wise)...")
+        sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "filtered_signals")
+        
+        lead_sums = np.zeros(12, dtype=np.float64)
+        lead_sq_sums = np.zeros(12, dtype=np.float64)
+        total_samples = 0
+        
+        for _, row in train_df.iterrows():
+            ecg_id = row['ecg_id']
+            npy_path = os.path.join(sinyal_dizini, f"{ecg_id}.npy")
+            if os.path.exists(npy_path):
+                signal = np.load(npy_path)  # (12, 2500)
+                lead_sums += signal.sum(axis=1)
+                lead_sq_sums += (signal ** 2).sum(axis=1)
+                total_samples += signal.shape[1]
+        
+        if total_samples > 0:
+            train_mean = lead_sums / total_samples  # (12,)
+            train_std = np.sqrt(lead_sq_sums / total_samples - train_mean ** 2)  # (12,)
+            train_std = np.maximum(train_std, 1e-6)  # Bolu sifir korunmasi
+            
+            stats_yolu = os.path.join(config.PROCESSED_DATA_DIR, "train_stats.npz")
+            np.savez(stats_yolu, mean=train_mean.astype(np.float32), std=train_std.astype(np.float32))
+            print(f"  Kaydedildi: {stats_yolu}")
+            print(f"  Mean (per lead): {np.round(train_mean, 4)}")
+            print(f"  Std  (per lead): {np.round(train_std, 4)}")
 
     return train_df, val_df, test_df
-
 
 if __name__ == "__main__":
     veri_bolme_pipeline()
