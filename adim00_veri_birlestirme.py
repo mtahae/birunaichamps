@@ -225,6 +225,46 @@ def scan_dataset(dataset_name, dataset_root):
     return records
 
 
+def scan_teknofest(dataset_root):
+    """
+    TEKNOFEST 2026 verisini labels.csv uzerinden okur.
+    """
+    labels_path = os.path.join(dataset_root, "labels.csv")
+    if not os.path.exists(labels_path):
+        print(f"  [UYARI] TEKNOFEST labels.csv bulunamadi: {labels_path}")
+        return []
+
+    df = pd.read_csv(labels_path)
+    records = []
+    
+    for _, row in tqdm(df.iterrows(), desc=f"  {'TEKNOFEST':18s}", total=len(df), ncols=80):
+        rel_header_path = row['header_path']
+        abs_header_path = os.path.join(dataset_root, rel_header_path)
+        signal_path = os.path.splitext(abs_header_path)[0]
+        
+        if not os.path.exists(abs_header_path):
+            continue
+            
+        ecg_id = f"TEKNOFEST_{row['record_id']}"
+        label = int(row['class_id'])
+        
+        records.append({
+            'ecg_id': ecg_id,
+            'dataset_source': 'TEKNOFEST',
+            'signal_path': signal_path,
+            'label': label,
+            'original_fs': int(row['sampling_rate_hz']),
+            'num_samples': int(row['duration_sec']) * int(row['sampling_rate_hz']),
+            'num_leads': int(row['lead_count']),
+            'age': "Unknown",
+            'sex': "Unknown",
+            'dx_codes': str(label), # Dummy
+        })
+        
+    print(f"    -> TEKNOFEST: {len(records)} kayit")
+    return records
+
+
 # =============================================================================
 # ANA BIRLESTIRME PIPELINE'I
 # =============================================================================
@@ -242,10 +282,15 @@ def birlestirme_pipeline():
 
     # --- 1. Veri setlerini tara ---
     print(f"\n[1/3] Veri setleri taraniyor...")
-    print(f"      Toplam {len(config.DATASET_PATHS)} veri seti\n")
+    print(f"      Toplam {len(config.DATASET_PATHS) + 1} veri seti\n")
 
     tum_kayitlar = []
 
+    # TEKNOFEST Verisi
+    tekno_kayitlar = scan_teknofest(config.TEKNOFEST_DIR)
+    tum_kayitlar.extend(tekno_kayitlar)
+
+    # Internet Verileri (PhysioNet Challenge vb.)
     for ds_name, ds_path in config.DATASET_PATHS.items():
         kayitlar = scan_dataset(ds_name, ds_path)
         print(f"    -> {ds_name}: {len(kayitlar)} kayit")
