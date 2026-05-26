@@ -9,8 +9,7 @@ Islem Adimlari:
     1. Sinyal okunmasi (wfdb — .mat + .hea dosyalari)
     2. Alt ornekleme: 500 Hz -> 250 Hz
     3. Butterworth Bandpass Filtre: 0.5-40 Hz, order=4
-    4. ArcTan Normalizasyonu (R-tepesi baskilama)
-    (NOT: Z-score normalizasyonu adim06/DataLoader asamasinda train istatistikleriyle yapilacaktir.)
+    4. Z-score Normalizasyon
 
 Ciktilar:
     - outputs/processed_data/filtered_signals/  (her kayit icin .npy)
@@ -82,14 +81,18 @@ def alt_ornekle(sinyal_2d, orijinal_fs, hedef_fs):
     return alt_orneklenmis
 
 
-def arctan_normalize(sinyal_2d):
-    """
-    Sinyali arctan fonksiyonundan gecirir.
-    Amac: Asiri yuksek voltajli R-tepelerini (R-peaks) baskilayarak modelin 
-    P dalgasi gibi daha kucuk morfolojilere de odaklanabilmesini saglamak.
-    (PhysioNet 2020 4. Takim - Triage yontemi)
-    """
-    return np.arctan(sinyal_2d)
+def z_score_normalize(sinyal_2d):
+    """Her derivasyonun ortalamasini 0, standart sapmasini 1 yapar."""
+    normalize = np.zeros_like(sinyal_2d, dtype=np.float32)
+    for kanal_idx in range(sinyal_2d.shape[0]):
+        kanal = sinyal_2d[kanal_idx]
+        ortalama = np.mean(kanal)
+        std = np.std(kanal)
+        if std > 1e-8:
+            normalize[kanal_idx] = (kanal - ortalama) / std
+        else:
+            normalize[kanal_idx] = kanal - ortalama
+    return normalize
 
 
 # =============================================================================
@@ -127,7 +130,7 @@ def filtreleme_pipeline():
     print(f"      Hedef Fs      : {config.TARGET_FS} Hz")
     print(f"      Bandpass      : {config.BANDPASS_LOW}-{config.BANDPASS_HIGH} Hz")
     print(f"      Filtre Order  : {config.BANDPASS_ORDER}")
-    print(f"      Normalizasyon : ArcTan (R-peak taming)\n")
+    print(f"      Normalizasyon : Z-score\n")
 
     basarili = 0
     basarisiz = 0
@@ -153,14 +156,13 @@ def filtreleme_pipeline():
                 orijinal_fs = config.ORIGINAL_FS
 
             # Alt ornekleme: 500 Hz -> 250 Hz
-
             sinyal = alt_ornekle(sinyal, orijinal_fs, config.TARGET_FS)
 
             # Butterworth bandpass filtre
             sinyal = cok_kanalli_filtrele(sinyal, config.TARGET_FS)
 
-            # ArcTan normalizasyonu
-            sinyal = arctan_normalize(sinyal)
+            # Z-score normalizasyon
+            sinyal = z_score_normalize(sinyal)
 
             # .npy olarak kaydet
             cikti_dosyasi = os.path.join(cikti_dizini, f"{ecg_id}.npy")

@@ -249,31 +249,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="class-bar-container">
         <div class="class-bar-label">
-          <span>AFIB</span>
+          <span>Ritim Bozukluğu</span>
           <span id="f1Class1">—</span>
         </div>
         <div class="class-bar-bg"><div class="class-bar-fill" id="f1Bar1" style="width:0%; background:#fb923c;"></div></div>
       </div>
       <div class="class-bar-container">
         <div class="class-bar-label">
-          <span>AFL</span>
+          <span>İletim Bozukluğu</span>
           <span id="f1Class2">—</span>
         </div>
         <div class="class-bar-bg"><div class="class-bar-fill" id="f1Bar2" style="width:0%; background:#60a5fa;"></div></div>
-      </div>
-      <div class="class-bar-container">
-        <div class="class-bar-label">
-          <span>LBBB</span>
-          <span id="f1Class3">—</span>
-        </div>
-        <div class="class-bar-bg"><div class="class-bar-fill" id="f1Bar3" style="width:0%; background:#a78bfa;"></div></div>
-      </div>
-      <div class="class-bar-container">
-        <div class="class-bar-label">
-          <span>RBBB</span>
-          <span id="f1Class4">—</span>
-        </div>
-        <div class="class-bar-bg"><div class="class-bar-fill" id="f1Bar4" style="width:0%; background:#f87171;"></div></div>
       </div>
     </div>
     <div class="card">
@@ -383,7 +369,7 @@ function updateDashboard(data) {
 
   // Class F1
   if (last.val_f1_class) {
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 3; i++) {
       const val = last.val_f1_class[i];
       document.getElementById('f1Class' + i).textContent = val.toFixed(4);
       document.getElementById('f1Bar' + i).style.width = (val * 100) + '%';

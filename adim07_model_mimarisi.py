@@ -2,22 +2,17 @@
 adim07_model_mimarisi.py — BirunAI EKG Siniflandirma: Adim 7 – Model Mimarisi
 ================================================================================
 
-CardioFusion-5: SE-ResNet + Transformer + Wide Features + DANN + Multi-Task
+Hibrit 1D-CNN + BiLSTM + Self-Attention modeli.
 
-PDF'deki TUM yontemlerin profesyonelce uygulandigi versiyon:
-    - SE-ResNet (Squeeze-and-Excitation)
-    - Transformer Encoder (Zamansal iliskiler)
-    - Wide Features (Fizyolojik ozellikler — features.py'den)
-    - DANN (Gradient Reversal Layer — Domain Adaptasyonu)
-    - Multi-Task Loss (5-sinif main + 3-sinif aux — PDF Bolum 8)
-    - Lead-Wise Z-Score (Train istatistikleriyle — PDF Bolum 1)
+Mimari:
+    Girdi: (batch, 12, 2500)
+    -> 3x CNN Blok (Conv1d + BN + ReLU + MaxPool + Dropout)
+    -> BiLSTM (2 katman, bidirectional)
+    -> Self-Attention (weighted sum)
+    -> FC (2 katman)
+    -> (batch, 3) logits
 
-YASAK OLANLAR (PDF Bolum 6 Kritik Hususlar):
-    - np.roll (zaman kaydirma)
-    - Global Z-Score
-    - Global amplitude scale
-    - Random crop
-    - 50Hz notch
+Toplam parametre: ~1.15M
 """
 
 import os
@@ -33,107 +28,117 @@ import random
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
+
 # =============================================================================
-# EKG AUGMENTASYON (PDF Bolum 3 — Yapilaacaklar/Yasaklar)
+# EKG AUGMENTASYON
 # =============================================================================
 
 class EKGAugmentation:
     """
-    PDF Bolum 3 Augmentasyon Kurallari:
-    
-    IZIN VERILENLER:
-    1. Lead-Wise Amplitude Scale (0.9-1.1)
-    2. Gaussian Noise (SNR > 20 dB)
-    3. Lead Dropout (1-2 lead sifirla)
-    4. Baseline Wander (sinuzoidal drift)
-    
-    ASLA YAPILMAYACAKLAR:
-    1. np.roll (zaman kaydirma) -> P-QRS-T bozulur
-    2. Random crop -> P/T dalgasi kaybolur
-    3. Global amplitude scale -> V1/V6 orani bozulur
+    EKG sinyalleri icin veri augmentasyonu.
+
+    Neden augmentasyon?
+        - Ritim Bozuklugu sinifi sadece 378 egitim ornegine sahip.
+        - Augmentasyon, her epoch'ta farkli varyasyonlar uretiyor
+          ve modelin ezberlemesini onluyor.
+        - Train/Val F1 gapini kapatmanin en etkili yolu.
+
+    Teknikler:
+        1. Time Shift    : Sinyali rastgele kaydirma (circular)
+        2. Gaussian Noise: Kucuk rastgele gurultu ekleme
+        3. Amplitude Scale: Genlik olcekleme (0.85-1.15x)
+        4. Lead Dropout  : Rastgele 1-2 derivasyonu sifirla
     """
-    def __init__(self, p=0.8):
+
+    def __init__(self,
+                 time_shift_max=200,
+                 noise_std=0.05,
+                 amplitude_range=(0.85, 1.15),
+                 lead_dropout_prob=0.15,
+                 p=0.8):
+        """
+        Args:
+            time_shift_max: Maksimum kaydirma miktari (ornek sayisi)
+            noise_std: Gaussian gurultu standart sapmasi
+            amplitude_range: Genlik olcekleme araligi (min, max)
+            lead_dropout_prob: Her derivasyonun sifirlanma olasiligi
+            p: Augmentasyonun toplam uygulanma olasiligi
+        """
+        self.time_shift_max = time_shift_max
+        self.noise_std = noise_std
+        self.amplitude_range = amplitude_range
+        self.lead_dropout_prob = lead_dropout_prob
         self.p = p
 
     def __call__(self, sinyal):
-        """sinyal: (12, 2500)"""
+        """
+        Args:
+            sinyal: numpy array (12, 2500)
+
+        Returns:
+            numpy array (12, 2500) augmente edilmis sinyal
+        """
         if random.random() > self.p:
-            return sinyal
+            return sinyal  # Augmentasyon uygulanmadi
 
         sinyal = sinyal.copy()
-        C, L = sinyal.shape
 
-        # 1. Lead-Wise Amplitude Scale (0.9-1.1) — PDF: Her lead bagimsiz
+        # 1. Time Shift (circular): Sinyali zaman ekseninde kaydır
         if random.random() < 0.5:
-            scale = np.random.uniform(0.9, 1.1, size=(C, 1)).astype(np.float32)
-            sinyal *= scale
+            shift = random.randint(-self.time_shift_max, self.time_shift_max)
+            sinyal = np.roll(sinyal, shift, axis=1)
 
-        # 2. Gaussian Noise (hafif) — PDF: SNR > 20 dB
+        # 2. Gaussian Noise: Kucuk gurultu ekle
         if random.random() < 0.5:
-            noise = np.random.normal(0, 0.01, sinyal.shape).astype(np.float32)
-            sinyal += noise
+            noise = np.random.normal(0, self.noise_std, sinyal.shape).astype(np.float32)
+            sinyal = sinyal + noise
 
-        # 3. Lead Dropout — PDF: 1-2 lead sifirla
+        # 3. Amplitude Scaling: Genlik olcekle
+        if random.random() < 0.5:
+            scale = random.uniform(*self.amplitude_range)
+            sinyal = sinyal * scale
+
+        # 4. Lead Dropout: Bazi derivasyonlari sifirla
         if random.random() < 0.3:
-            n_dropout = random.choice([1, 2])
-            dropout_leads = np.random.choice(C, size=n_dropout, replace=False)
-            for ch in dropout_leads:
-                sinyal[ch] = 0.0
-
-        # 4. Baseline Wander (sinuzoidal drift)
-        if random.random() < 0.5:
-            t = np.linspace(0, 10, L)
-            for ch in range(C):
-                if random.random() < 0.3:
-                    freq = random.uniform(0.1, 0.5)
-                    amp = random.uniform(0.05, 0.3)
-                    drift = amp * np.sin(2 * np.pi * freq * t + random.uniform(0, 2*np.pi))
-                    sinyal[ch] += drift.astype(np.float32)
+            for ch in range(sinyal.shape[0]):
+                if random.random() < self.lead_dropout_prob:
+                    sinyal[ch] = 0.0
 
         return sinyal
 
+
+# Varsayilan augmentasyon instance'i
 DEFAULT_AUGMENTATION = EKGAugmentation()
 
+
 # =============================================================================
-# EKG DATASET — PDF Bolum 1 (Lead-Wise Z-Score, Train Stats)
+# EKG DATASET
 # =============================================================================
 
 class EKGDataset(Dataset):
     """
-    Multimodal EKG Dataset.
-    
-    Z-Score Normalizasyonu:
-        PDF KRITIK KURAL: "mu ve sigma SADECE train setinden hesaplanir,
-        val/test'e uygulanir. Global Z-Score ASLA yapilmaz."
-        
-        Eger train_stats_path verilmisse, oradan yukler.
-        Verilmemisse per-sample lead-wise yapar (fallback).
+    Segmente edilmis EKG sinyallerini PyTorch Dataset olarak sarmalar.
+
+    Her __getitem__ cagrisi:
+        1. ecg_id'ye gore .npy dosyasini yukler
+        2. augment=True ise augmentasyon uygular (sadece train)
+        3. torch.FloatTensor'a cevirir (12, 2500)
+        4. Etiketi torch.LongTensor olarak dondurur
     """
-    def __init__(self, manifest_path, sinyal_dizini, augment=False, train_stats_path=None):
+
+    def __init__(self, manifest_path, sinyal_dizini, augment=False):
+        """
+        Args:
+            manifest_path: train/val/test_manifest.csv dosya yolu
+            sinyal_dizini: segmented_signals/ dizin yolu
+            augment: True ise egitim augmentasyonu uygula (sadece train seti)
+        """
         self.df = pd.read_csv(manifest_path, index_col="ecg_id")
         self.sinyal_dizini = sinyal_dizini
         self.ecg_ids = self.df.index.tolist()
         self.labels = self.df["label"].values.astype(int)
-        
-        # Aux labels (Multi-Task) — PDF Bolum 8
-        self.aux_labels = np.array([config.MAIN_TO_AUX_LABEL[l] for l in self.labels], dtype=int)
-        
-        # Domain ID (DANN)
-        if "domain_id" in self.df.columns:
-            self.domains = self.df["domain_id"].values.astype(int)
-        else:
-            self.domains = np.zeros(len(self.df), dtype=int)
-            
         self.augment = augment
         self.augmentation = DEFAULT_AUGMENTATION if augment else None
-        
-        # Train istatistikleri yukle (Z-Score icin)
-        self.train_mean = None
-        self.train_std = None
-        if train_stats_path and os.path.exists(train_stats_path):
-            stats = np.load(train_stats_path)
-            self.train_mean = stats['mean']  # (12,)
-            self.train_std = stats['std']    # (12,)
 
     def __len__(self):
         return len(self.ecg_ids)
@@ -142,250 +147,162 @@ class EKGDataset(Dataset):
         ecg_id = self.ecg_ids[idx]
         sinyal_yolu = os.path.join(self.sinyal_dizini, f"{ecg_id}.npy")
         sinyal = np.load(sinyal_yolu)  # (12, 2500) float32
-        
-        # Guvenlik: Sinyal tam 2500 sample degilse crop/pad yap
-        target_len = config.TARGET_LENGTH
-        if sinyal.shape[1] > target_len:
-            start = (sinyal.shape[1] - target_len) // 2
-            sinyal = sinyal[:, start:start + target_len]
-        elif sinyal.shape[1] < target_len:
-            padded = np.zeros((sinyal.shape[0], target_len), dtype=sinyal.dtype)
-            pad = (target_len - sinyal.shape[1]) // 2
-            padded[:, pad:pad + sinyal.shape[1]] = sinyal
-            sinyal = padded
-        
+
         # Augmentasyon (sadece train)
-        if self.augment and self.augmentation:
+        if self.augment and self.augmentation is not None:
             sinyal = self.augmentation(sinyal)
 
-        # Lead-Wise Z-Score Normalizasyonu — PDF BOLUM 1 KRITIK
-        if self.train_mean is not None and self.train_std is not None:
-            # Train istatistikleriyle normalize et (DOGRU yontem)
-            for c in range(sinyal.shape[0]):
-                if self.train_std[c] > 1e-6:
-                    sinyal[c] = (sinyal[c] - self.train_mean[c]) / self.train_std[c]
-                else:
-                    sinyal[c] = sinyal[c] - self.train_mean[c]
-        else:
-            # Fallback: Per-sample lead-wise (train stats yoksa)
-            for c in range(sinyal.shape[0]):
-                std = np.std(sinyal[c])
-                if std > 1e-6:
-                    sinyal[c] = (sinyal[c] - np.mean(sinyal[c])) / std
-
-        sinyal_tensor = torch.FloatTensor(sinyal)
-        etiket_tensor = torch.LongTensor([self.labels[idx]])[0]
-        aux_etiket_tensor = torch.LongTensor([self.aux_labels[idx]])[0]
-        domain_tensor = torch.LongTensor([self.domains[idx]])[0]
-        
-        # Wide Features — simdilik sifir, features.py ile precompute edilecek
-        wide_features = torch.zeros(config.WIDE_FEATURE_DIM, dtype=torch.float32)
-
-        return sinyal_tensor, wide_features, etiket_tensor, aux_etiket_tensor, domain_tensor
-
-# =============================================================================
-# DANN - GRADIENT REVERSAL LAYER
-# =============================================================================
-
-class GradientReversalLayer(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
-
-def grad_reverse(x, alpha=1.0):
-    return GradientReversalLayer.apply(x, alpha)
-
-# =============================================================================
-# SE-RESNET BLOKLARI
-# =============================================================================
-
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation: Kanal bazinda agirliklandirma."""
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool1d(1)
-        reduced = max(channels // reduction, 4)
-        self.excitation = nn.Sequential(
-            nn.Linear(channels, reduced, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(reduced, channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _ = x.size()
-        y = self.squeeze(x).view(b, c)
-        y = self.excitation(y).view(b, c, 1)
-        return x * y.expand_as(x)
-
-
-class ResNetBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, downsample=None):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.se = SEBlock(out_channels)
-        self.downsample = downsample
-
-    def forward(self, x):
-        identity = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.se(out)
-        if self.downsample is not None:
-            identity = self.downsample(x)
-        out += identity
-        return self.relu(out)
+        sinyal = torch.FloatTensor(sinyal)       # (12, 2500)
+        etiket = torch.LongTensor([self.labels[idx]])[0]
+        return sinyal, etiket
 
 
 # =============================================================================
-# ANA MODEL: CARDIOFUSION-5 — PDF Bolum 2 (Versiyon A + B Birlesik)
+# SELF-ATTENTION MODULU
 # =============================================================================
 
-class CardioFusion5(nn.Module):
+class SelfAttention(nn.Module):
     """
-    CardioFusion-5 Unified Model
-    
-    PDF'deki her iki versiyonun (Efficient + Pro) en iyi ozelliklerini birlestirir:
-    - SE-ResNet Feature Extractor (Versiyon A — CNN + SE)
-    - Transformer Encoder (Versiyon B — Zamansal)
-    - Wide Features (Versiyon A — Precomputed fizyolojik)
-    - DANN (Versiyon B — Domain Adversarial)
-    - Multi-Task Loss (Her iki versiyon — 5+3 sinif)
+    Self-Attention mekanizmasi.
+
+    BiLSTM ciktisinin her zaman adimina onem skoru atar,
+    sonra agirlikli toplam ile tek bir vektor uretir.
+
+    Bu, modelin EKG sinyalinin hangi bolgelerine odaklandigini
+    gosterir -> GradCAM ile birlikte XAI destegi saglar.
     """
-    def __init__(self, num_classes=5, num_aux_classes=3, num_domains=2, wide_feature_dim=8):
+
+    def __init__(self, input_dim):
         super().__init__()
-        
-        # 1. Feature Extractor (SE-ResNet)
-        self.in_channels = 64
-        self.conv1 = nn.Conv1d(config.NUM_LEADS, 64, kernel_size=config.CNN_KERNEL_SIZE_1, stride=2, padding=7, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
-        
-        self.layer1 = self._make_layer(64, 2, kernel_size=7)
-        self.layer2 = self._make_layer(128, 2, kernel_size=7, stride=2)
-        self.layer3 = self._make_layer(256, 2, kernel_size=7, stride=2)
-        self.layer4 = self._make_layer(config.TRANSFORMER_DIM, 2, kernel_size=7, stride=2)
-        
-        # 2. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.TRANSFORMER_DIM,
-            nhead=config.TRANSFORMER_HEADS,
-            dropout=config.TRANSFORMER_DROPOUT,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.TRANSFORMER_LAYERS)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
-        # 3. Main Classifier (Deep + Wide) — PDF: Dense(128) -> Dense(5)
-        self.fc_deep = nn.Linear(config.TRANSFORMER_DIM, 128)
-        self.classifier = nn.Sequential(
-            nn.Linear(128 + wide_feature_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
-        )
-        
-        # 4. Auxiliary Classifier (Multi-Task) — PDF Bolum 8
-        # 3-sinif: Normal / Ritim Bozuklugu / Iletim Bozuklugu
-        self.aux_classifier = nn.Sequential(
-            nn.Linear(config.TRANSFORMER_DIM, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_aux_classes)
-        )
-        
-        # 5. Domain Classifier (DANN) — PDF Versiyon B
-        self.domain_classifier = nn.Sequential(
-            nn.Linear(config.TRANSFORMER_DIM, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_domains)
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1)
         )
 
-    def _make_layer(self, out_channels, blocks, kernel_size, stride=1):
-        downsample = None
-        if stride != 1 or self.in_channels != out_channels:
-            downsample = nn.Sequential(
-                nn.Conv1d(self.in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-        layers = []
-        layers.append(ResNetBlock(self.in_channels, out_channels, kernel_size, stride, downsample))
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(ResNetBlock(out_channels, out_channels, kernel_size))
-        return nn.Sequential(*layers)
-
-    def forward(self, x, wide_features=None, alpha=1.0):
+    def forward(self, lstm_output):
         """
         Args:
-            x: (batch, 12, 2500) — EKG sinyali
-            wide_features: (batch, 8) — Fizyolojik ozellikler
-            alpha: DANN gradient reversal katsayisi
-            
+            lstm_output: (batch, seq_len, hidden_dim)
+
         Returns:
-            class_logits: (batch, 5) — Ana sinif tahminleri
-            aux_logits: (batch, 3) — Yardimci sinif (Ritim/Iletim/Normal)
-            domain_logits: (batch, 2) — Domain tahmini
+            context: (batch, hidden_dim) — agirlikli toplam
+            attn_weights: (batch, seq_len) — attention skorlari
         """
-        # CNN
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        
-        # Transformer
-        x = x.permute(0, 2, 1)
-        x = self.transformer(x)
-        x = x.permute(0, 2, 1)
-        
-        # Pooling
-        deep_features = self.global_pool(x).squeeze(-1)  # (batch, 384)
-        
-        # Auxiliary Classification (Multi-Task) — dogrudan deep_features'tan
-        aux_logits = self.aux_classifier(deep_features)
-        
-        # Domain Classification (DANN — Gradient Reversal)
-        domain_features = grad_reverse(deep_features, alpha)
-        domain_logits = self.domain_classifier(domain_features)
-        
-        # Main Classification (Deep + Wide)
-        deep_out = F.relu(self.fc_deep(deep_features))
-        if wide_features is not None:
-            combined = torch.cat([deep_out, wide_features], dim=1)
-        else:
-            dummy_wide = torch.zeros(deep_out.size(0), config.WIDE_FEATURE_DIM, device=deep_out.device)
-            combined = torch.cat([deep_out, dummy_wide], dim=1)
-            
-        class_logits = self.classifier(combined)
-        
-        return class_logits, aux_logits, domain_logits
+        attn_scores = self.attention(lstm_output)       # (batch, seq_len, 1)
+        attn_weights = F.softmax(attn_scores, dim=1)    # normalize over time
+        context = torch.sum(lstm_output * attn_weights, dim=1)  # (batch, hidden_dim)
+        return context, attn_weights.squeeze(-1)
 
 
 # =============================================================================
-# FOCAL LOSS — PDF Bolum 6
+# ANA MODEL: 1D-CNN + BiLSTM + ATTENTION
+# =============================================================================
+
+class BirunAIModel(nn.Module):
+    """
+    BirunAI EKG Siniflandirma Modeli.
+
+    Mimari:
+        1D-CNN (3 blok) -> BiLSTM (2 katman) -> Self-Attention -> FC
+
+    Neden bu mimari?
+        - CNN: Yerel morfoloji (P, QRS, T dalga sekilleri)
+        - BiLSTM: Zamansal bagimlilik (ritim duzenliligi, PR iliskisi)
+        - Attention: Hangi zaman dilimine odaklanmali? (XAI)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # --- CNN Bloklari ---
+        cnn_layers = []
+        in_channels = config.NUM_LEADS  # 12
+
+        for out_channels in config.CNN_FILTERS:  # [64, 128, 256]
+            cnn_layers.extend([
+                nn.Conv1d(in_channels, out_channels,
+                          kernel_size=config.CNN_KERNEL_SIZE,
+                          padding=config.CNN_KERNEL_SIZE // 2),
+                nn.BatchNorm1d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.MaxPool1d(2),
+                nn.Dropout(config.CNN_DROPOUT)
+            ])
+            in_channels = out_channels
+
+        self.cnn = nn.Sequential(*cnn_layers)
+
+        # --- BiLSTM ---
+        self.lstm = nn.LSTM(
+            input_size=config.CNN_FILTERS[-1],     # 256
+            hidden_size=config.LSTM_HIDDEN_SIZE,    # 128
+            num_layers=config.LSTM_NUM_LAYERS,      # 2
+            batch_first=True,
+            bidirectional=True,
+            dropout=config.LSTM_DROPOUT if config.LSTM_NUM_LAYERS > 1 else 0
+        )
+
+        lstm_output_size = config.LSTM_HIDDEN_SIZE * 2  # bidirectional -> 256
+
+        # --- Self-Attention ---
+        self.attention = SelfAttention(lstm_output_size)
+
+        # --- Fully Connected ---
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_output_size, config.FC_HIDDEN_SIZE),
+            nn.ReLU(inplace=True),
+            nn.Dropout(config.FC_DROPOUT),
+            nn.Linear(config.FC_HIDDEN_SIZE, config.NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, 12, 2500) — 12 derivasyon EKG sinyali
+
+        Returns:
+            logits: (batch, 3) — sinif skorlari
+        """
+        x = self.cnn(x)                    # (batch, 256, 312)
+        x = x.permute(0, 2, 1)             # (batch, 312, 256)
+        x, _ = self.lstm(x)                # (batch, 312, 256)
+        x, _ = self.attention(x)           # (batch, 256)
+        x = self.fc(x)                     # (batch, 3)
+        return x
+
+    def forward_with_attention(self, x):
+        """Forward pass + attention weights dondurur (GradCAM/XAI icin)."""
+        cnn_out = self.cnn(x)
+        lstm_in = cnn_out.permute(0, 2, 1)
+        lstm_out, _ = self.lstm(lstm_in)
+        context, attn_weights = self.attention(lstm_out)
+        logits = self.fc(context)
+        return logits, attn_weights
+
+
+# =============================================================================
+# FOCAL LOSS
 # =============================================================================
 
 class FocalLoss(nn.Module):
     """
     Focal Loss + Label Smoothing.
+
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    
-    gamma=0 -> Standart CrossEntropy
-    gamma=2 -> Kolay orneklerin katkisi ~0.25x'e duser
+
+    gamma = 0 -> Standart CrossEntropy
+    gamma = 2 -> Kolay orneklerin katkisi ~0.25x'e duser, zor orneklere odaklanir
+
+    Label Smoothing:
+        Gercek etiketi 1.0 yerine (1 - smoothing) yapar,
+        diger siniflara smoothing/(num_classes-1) dagitir.
+        Bu, modelin asiri guvenliligi (overconfidence) onler ve
+        overfitting'i azaltir.
+
+    alpha_t: Sinif agirligi (class_weights.npy'den)
     """
+
     def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
         super().__init__()
         self.gamma = gamma
@@ -399,7 +316,18 @@ class FocalLoss(nn.Module):
             self.alpha = None
 
     def forward(self, logits, targets):
-        ce_loss = F.cross_entropy(logits, targets, reduction='none', label_smoothing=self.label_smoothing)
+        """
+        Args:
+            logits: (batch, num_classes) — model ciktisi
+            targets: (batch,) — gercek etiketler
+
+        Returns:
+            scalar: Ortalama focal loss
+        """
+        ce_loss = F.cross_entropy(
+            logits, targets, reduction='none',
+            label_smoothing=self.label_smoothing
+        )
         pt = torch.exp(-ce_loss)
         focal_weight = (1 - pt) ** self.gamma
 
@@ -413,14 +341,15 @@ class FocalLoss(nn.Module):
 
 
 # =============================================================================
-# YARDIMCI
+# YARDIMCI FONKSIYONLAR
 # =============================================================================
 
 def model_ozetini_yazdir(model):
-    """Model parametre sayisini yazdirir."""
+    """Model parametre sayisini ve boyutunu yazdirir."""
     toplam = sum(p.numel() for p in model.parameters())
     egitim = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    boyut_mb = toplam * 4 / (1024 * 1024)
+    boyut_mb = toplam * 4 / (1024 * 1024)  # float32
+
     print(f"\n  Model Ozeti:")
     print(f"    Toplam parametre    : {toplam:,}")
     print(f"    Egitilebilir param  : {egitim:,}")
@@ -434,18 +363,46 @@ def model_ozetini_yazdir(model):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("BirunAI -- CardioFusion-5 Mimari Testi (Aux Head + DANN)")
+    print("BirunAI -- Adim 7: Model Mimarisi Testi")
     print("=" * 70)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CardioFusion5().to(device)
+    print(f"\n  Cihaz: {device}")
+    if device.type == 'cuda':
+        print(f"  GPU  : {torch.cuda.get_device_name(0)}")
+
+    # Model olustur
+    model = BirunAIModel().to(device)
     model_ozetini_yazdir(model)
 
+    # Test girdisi
     dummy_input = torch.randn(4, 12, 2500).to(device)
-    dummy_wide = torch.randn(4, 8).to(device)
-    
-    class_logits, aux_logits, domain_logits = model(dummy_input, dummy_wide, alpha=0.1)
-    print(f"\n  Main   Logits: {class_logits.shape} (Beklenen: 4, 5)")
-    print(f"  Aux    Logits: {aux_logits.shape} (Beklenen: 4, 3)")
-    print(f"  Domain Logits: {domain_logits.shape} (Beklenen: 4, 2)")
-    print("\n  Mimari testi BASARILI!")
+    output = model(dummy_input)
+    print(f"\n  Test girdi shape  : {dummy_input.shape}")
+    print(f"  Test cikti shape  : {output.shape}")
+    print(f"  Beklenen          : (4, 3)")
+
+    # Attention testi
+    logits, attn = model.forward_with_attention(dummy_input)
+    print(f"  Attention shape   : {attn.shape}")
+
+    # Focal Loss testi
+    class_weights = np.load(os.path.join(config.PROCESSED_DATA_DIR, "class_weights.npy"))
+    criterion = FocalLoss(alpha=class_weights, gamma=config.FOCAL_LOSS_GAMMA).to(device)
+    targets = torch.tensor([0, 1, 2, 0]).to(device)
+    loss = criterion(output, targets)
+    print(f"\n  Focal Loss test   : {loss.item():.4f}")
+
+    # Dataset testi
+    train_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv")
+    sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "segmented_signals")
+    if os.path.exists(train_manifest):
+        dataset = EKGDataset(train_manifest, sinyal_dizini)
+        sinyal, etiket = dataset[0]
+        print(f"\n  Dataset boyut     : {len(dataset)}")
+        print(f"  Sinyal shape      : {sinyal.shape}")
+        print(f"  Etiket            : {etiket.item()}")
+
+    print("\n" + "=" * 70)
+    print("Adim 7 tamamlandi. Model hazir!")
+    print("=" * 70)
