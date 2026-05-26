@@ -1,0 +1,12 @@
+ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/
+datasets/
+env/
+__pycache__/
+*.pyc
+outputs/
+HeartBeats/
+Prna/
+SharifAITeam/
+Triage/
+Between_a_ROC_and_a_heart_place/
+*.pdf
