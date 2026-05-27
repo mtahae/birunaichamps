@@ -166,7 +166,7 @@ WIDE_FEATURE_DIM = 8
 # =============================================================================
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 5e-4  # Overfitting onleme: 1e-4 -> 5e-4
 NUM_EPOCHS = 100
 
 # Curriculum Learning Asamalari — PDF: Epoch 1-20, 21-80, 81-100
@@ -180,7 +180,7 @@ DANN_LAMBDA = 0.1
 # Loss Hyperparametreleri — PDF BOLUM 6
 FOCAL_LOSS_GAMMA = 2.0
 FOCAL_GAMMA = FOCAL_LOSS_GAMMA  # Alias (eski kod uyumlulugu)
-LABEL_SMOOTHING = 0.05
+LABEL_SMOOTHING = 0.10  # Overfitting onleme: 0.05 -> 0.10
 AUX_LOSS_WEIGHT = 0.3  # Multi-Task: L = L_main + 0.3 * L_aux
 
 # Egitim Kontrolleri

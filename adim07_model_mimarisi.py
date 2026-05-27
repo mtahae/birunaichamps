@@ -90,6 +90,15 @@ class EKGAugmentation:
                     drift = amp * np.sin(2 * np.pi * freq * t + random.uniform(0, 2*np.pi))
                     sinyal[ch] += drift.astype(np.float32)
 
+        # 5. Time Masking — Rastgele bir zaman segmentini sifirla
+        #    SpecAugment'in EKG versiyonu. np.roll veya crop DEGIL, sadece maskeleme.
+        if random.random() < 0.4:
+            mask_len = random.randint(50, 250)  # 50-250 sample (0.2-1.0 saniye)
+            max_start = L - mask_len
+            if max_start > 0:
+                start = random.randint(0, max_start)
+                sinyal[:, start:start + mask_len] = 0.0
+
         return sinyal
 
 DEFAULT_AUGMENTATION = EKGAugmentation()
@@ -109,7 +118,8 @@ class EKGDataset(Dataset):
         Eger train_stats_path verilmisse, oradan yukler.
         Verilmemisse per-sample lead-wise yapar (fallback).
     """
-    def __init__(self, manifest_path, sinyal_dizini, augment=False, train_stats_path=None):
+    def __init__(self, manifest_path, sinyal_dizini, augment=False, train_stats_path=None,
+                 wide_features_dir=None):
         self.df = pd.read_csv(manifest_path, index_col="ecg_id")
         self.sinyal_dizini = sinyal_dizini
         self.ecg_ids = self.df.index.tolist()
@@ -126,6 +136,28 @@ class EKGDataset(Dataset):
             
         self.augment = augment
         self.augmentation = DEFAULT_AUGMENTATION if augment else None
+        
+        # Wide Features dizini ve bellege yukleme (I/O hizlandirma)
+        self.wide_features_dir = wide_features_dir
+        self.wide_features_array = np.zeros((len(self.ecg_ids), config.WIDE_FEATURE_DIM), dtype=np.float32)
+        
+        if self.wide_features_dir is not None:
+            # Manifest turune gore (train/val) cache dosyasi olustur (Saniyeler icinde yuklenmesi icin)
+            is_train = "train" in manifest_path.lower()
+            cache_file = os.path.join(self.wide_features_dir, f"{'train' if is_train else 'val'}_wide_features_cache.npy")
+            
+            if os.path.exists(cache_file):
+                print(f"  [EKGDataset] Wide Features Cache'den yukleniyor... ({'Train' if is_train else 'Val'})")
+                self.wide_features_array = np.load(cache_file)
+            else:
+                from tqdm import tqdm
+                print(f"  [EKGDataset] Wide Features RAM'e yukleniyor... (Ilk sefere mahsus biraz surebilir)")
+                for idx, ecg_id in enumerate(tqdm(self.ecg_ids, desc=f"  Yükleniyor ({'Train' if is_train else 'Val'})", leave=False)):
+                    wf_path = os.path.join(self.wide_features_dir, f"{ecg_id}.npy")
+                    if os.path.exists(wf_path):
+                        self.wide_features_array[idx] = np.load(wf_path)
+                # Cache olarak kaydet ki bir sonraki calistirmada 0.1 saniyede acilsin
+                np.save(cache_file, self.wide_features_array)
         
         # Train istatistikleri yukle (Z-Score icin)
         self.train_mean = None
@@ -178,8 +210,8 @@ class EKGDataset(Dataset):
         aux_etiket_tensor = torch.LongTensor([self.aux_labels[idx]])[0]
         domain_tensor = torch.LongTensor([self.domains[idx]])[0]
         
-        # Wide Features — simdilik sifir, features.py ile precompute edilecek
-        wide_features = torch.zeros(config.WIDE_FEATURE_DIM, dtype=torch.float32)
+        # Wide Features — RAM'den aninda oku
+        wide_features = torch.FloatTensor(self.wide_features_array[idx])
 
         return sinyal_tensor, wide_features, etiket_tensor, aux_etiket_tensor, domain_tensor
 
@@ -235,12 +267,14 @@ class ResNetBlock(nn.Module):
         self.bn2 = nn.BatchNorm1d(out_channels)
         self.se = SEBlock(out_channels)
         self.downsample = downsample
+        self.spatial_dropout = nn.Dropout(0.1)  # Spatial Dropout — CNN overfitting onleme
 
     def forward(self, x):
         identity = x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = self.se(out)
+        out = self.spatial_dropout(out)  # Feature map dropout
         if self.downsample is not None:
             identity = self.downsample(x)
         out += identity
@@ -289,10 +323,16 @@ class CardioFusion5(nn.Module):
         
         # 3. Main Classifier (Deep + Wide) — PDF: Dense(128) -> Dense(5)
         self.fc_deep = nn.Linear(config.TRANSFORMER_DIM, 128)
+        self.fc_deep_drop = nn.Dropout(0.2)  # Deep features dropout
+        
+        # Wide Features normalizasyonu — overfitting onleme
+        self.wide_bn = nn.BatchNorm1d(wide_feature_dim)
+        self.wide_drop = nn.Dropout(0.3)
+        
         self.classifier = nn.Sequential(
             nn.Linear(128 + wide_feature_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(64, num_classes)
         )
         
@@ -301,7 +341,7 @@ class CardioFusion5(nn.Module):
         self.aux_classifier = nn.Sequential(
             nn.Linear(config.TRANSFORMER_DIM, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(64, num_aux_classes)
         )
         
@@ -309,7 +349,7 @@ class CardioFusion5(nn.Module):
         self.domain_classifier = nn.Sequential(
             nn.Linear(config.TRANSFORMER_DIM, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(64, num_domains)
         )
 
@@ -362,9 +402,10 @@ class CardioFusion5(nn.Module):
         domain_logits = self.domain_classifier(domain_features)
         
         # Main Classification (Deep + Wide)
-        deep_out = F.relu(self.fc_deep(deep_features))
+        deep_out = self.fc_deep_drop(F.relu(self.fc_deep(deep_features)))
         if wide_features is not None:
-            combined = torch.cat([deep_out, wide_features], dim=1)
+            wide_norm = self.wide_drop(self.wide_bn(wide_features))  # BN + Dropout
+            combined = torch.cat([deep_out, wide_norm], dim=1)
         else:
             dummy_wide = torch.zeros(deep_out.size(0), config.WIDE_FEATURE_DIM, device=deep_out.device)
             combined = torch.cat([deep_out, dummy_wide], dim=1)

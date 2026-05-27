@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from adim07_model_mimarisi import CardioFusion5, EKGDataset, FocalLoss, model_ozetini_yazdir
 from threshold_opt import find_optimal_thresholds
+from torch.optim.swa_utils import AveragedModel, SWALR
 
 # =============================================================================
 # EGITIM LOG YONETIMI (Dashboard icin)
@@ -264,12 +265,23 @@ def egitim_pipeline():
 
     # --- Veri Setleri ---
     sinyal_dizini = os.path.join(config.PROCESSED_DATA_DIR, "filtered_signals")
+    wide_features_dir = os.path.join(config.PROCESSED_DATA_DIR, "wide_features")
     train_manifest = os.path.join(config.PROCESSED_DATA_DIR, "train_manifest.csv")
     val_manifest = os.path.join(config.PROCESSED_DATA_DIR, "val_manifest.csv")
     train_stats_path = os.path.join(config.PROCESSED_DATA_DIR, "train_stats.npz")
 
-    full_train_dataset = EKGDataset(train_manifest, sinyal_dizini, augment=True, train_stats_path=train_stats_path)
-    val_dataset = EKGDataset(val_manifest, sinyal_dizini, augment=False, train_stats_path=train_stats_path)
+    # Wide features dizini kontrolu
+    if os.path.exists(wide_features_dir) and len(os.listdir(wide_features_dir)) > 0:
+        wf_dir = wide_features_dir
+        print(f"\n  Wide Features: AKTIF ({len(os.listdir(wide_features_dir))} dosya)")
+    else:
+        wf_dir = None
+        print(f"\n  Wide Features: DEAKTIF (once adim07b_wide_features.py calistirilmali!)")
+
+    full_train_dataset = EKGDataset(train_manifest, sinyal_dizini, augment=True, 
+                                    train_stats_path=train_stats_path, wide_features_dir=wf_dir)
+    val_dataset = EKGDataset(val_manifest, sinyal_dizini, augment=False, 
+                             train_stats_path=train_stats_path, wide_features_dir=wf_dir)
 
     # Curriculum: TEKNOFEST vs Internet indeksleri
     tekno_indices = [i for i, d in enumerate(full_train_dataset.domains) if d == 0]
@@ -326,15 +338,17 @@ def egitim_pipeline():
     P3 = config.EPOCHS_PHASE_3  # 20
     TOTAL_EPOCHS = P1 + P2 + P3  # 100
     
-    # Her asama icin ayri patience (P2 daha uzun, cunku domain shift var)
+    # Her asama icin ayri patience
     PATIENCE_P1 = 15
-    PATIENCE_P2 = 25  # Internet verisine uyum icin daha sabir
-    PATIENCE_P3 = 15
+    PATIENCE_P2 = 15  # 25'ten dusuruldu — overfitting onleme
+    PATIENCE_P3 = 10
+    MIN_F1_IMPROVEMENT = 0.002  # F1 artisi bundan azsa "iyilesme" sayilmaz
 
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
     checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
     training_log = log_baslat(TOTAL_EPOCHS)
     best_f1 = 0.0
+    best_val_loss = float('inf')  # Val Loss divergence takibi
     patience_counter = 0
 
     print(f"\n  Egitim Parametreleri:")
@@ -344,13 +358,15 @@ def egitim_pipeline():
     print(f"    Total Epochs   : {TOTAL_EPOCHS}")
     print(f"    Phase 1 (Tekno): 1-{P1} (patience={PATIENCE_P1})")
     print(f"    Phase 2 (Karma): {P1+1}-{P1+P2} (patience={PATIENCE_P2}, Mixup+DANN)")
-    print(f"    Phase 3 (Fine) : {P1+P2+1}-{TOTAL_EPOCHS} (patience={PATIENCE_P3})")
+    print(f"    Phase 3 (Fine) : {P1+P2+1}-{TOTAL_EPOCHS} (patience={PATIENCE_P3}, SWA aktif)")
     print(f"    Mixed Precision: {'Evet' if use_amp else 'Hayir'}")
     print(f"\n{'='*70}\n  EGITIM BASLIYOR...\n{'='*70}\n")
 
     current_phase = 0  # 1=TEKNO, 2=KARMA, 3=FINE
     scheduler = None   # Her asama icin ayri scheduler olusturulacak
     skip_to_epoch = 0  # Early stop sonrasi atlama icin
+    swa_model = None   # SWA modeli (P3'te aktif olacak)
+    swa_scheduler = None
 
     for epoch in range(1, TOTAL_EPOCHS + 1):
         # Eger bir asama erken durduysa, sonraki asama baslayana kadar atla
@@ -407,7 +423,22 @@ def egitim_pipeline():
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=P3, eta_min=1e-7)
                 patience_counter = 0
-                print(f"    -> P3 LR={p3_lr:.6f} | Patience sifirlandi")
+                
+                # P3 BACKBONE FREEZE — Sadece Transformer + Classifier egitilir
+                # CNN backbone'u dondur (genel EKG paternlerini korumak icin)
+                frozen_count = 0
+                for name, param in model.named_parameters():
+                    if any(layer in name for layer in ['conv1.', 'bn1.', 'layer1.', 'layer2.', 'layer3.', 'layer4.']):
+                        param.requires_grad = False
+                        frozen_count += 1
+                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"    -> CNN Backbone DONDURULDU ({frozen_count} parametre grubu)")
+                print(f"    -> Egitilebilir parametre: {trainable:,} (Transformer + Classifier)")
+                
+                # SWA baslat — P3'te agirlik ortalaması ile daha iyi genelleme
+                swa_model = AveragedModel(model).to(device)
+                swa_scheduler = SWALR(optimizer, swa_lr=p3_lr * 0.5, anneal_epochs=5)
+                print(f"    -> P3 LR={p3_lr:.6f} | Patience sifirlandi | SWA aktif")
                 
             current_phase = new_phase
 
@@ -454,21 +485,29 @@ def egitim_pipeline():
 
         # Scheduler step (warmup'tan sonra)
         if not (current_phase == 1 and epoch <= config.WARMUP_EPOCHS):
-            if scheduler is not None:
+            if current_phase == 3 and swa_scheduler is not None:
+                swa_scheduler.step()
+                swa_model.update_parameters(model)
+            elif scheduler is not None:
                 scheduler.step()
             
         current_lr = optimizer.param_groups[0]['lr']
         epoch_duration = time.time() - epoch_start
 
-        # --- Checkpoint ---
-        if val_f1 > best_f1:
+        # --- Checkpoint (Min improvement esigi ile) ---
+        if val_f1 > best_f1 + MIN_F1_IMPROVEMENT:
             best_f1 = val_f1
+            best_val_loss = val_loss  # Val loss referansini guncelle
             patience_counter = 0
             torch.save(model.state_dict(), checkpoint_path)
             mark = " [BEST]"
         else:
             patience_counter += 1
             mark = ""
+        
+        # Val Loss takibi (divergence check icin)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
 
         # --- Log ---
         log_epoch_ekle(training_log, {
@@ -502,13 +541,146 @@ def egitim_pipeline():
             else:
                 print(f"\n  [EARLY STOPPING P3] {current_patience} epoch iyilesme yok. Egitim bitti.")
                 break
+        
+        # Val Loss Divergence Check — model tamamen cikmissa fazdan atla
+        if best_val_loss > 0 and val_loss > 2.5 * best_val_loss:
+            if current_phase < 3:
+                if current_phase == 1:
+                    skip_to_epoch = P1 + 1
+                    print(f"\n  [DIVERGENCE P1] Val Loss patlamasi! ({val_loss:.3f} > 2.5 * {best_val_loss:.3f}). P2'ye atlaniyor...")
+                elif current_phase == 2:
+                    skip_to_epoch = P1 + P2 + 1
+                    print(f"\n  [DIVERGENCE P2] Val Loss patlamasi! ({val_loss:.3f} > 2.5 * {best_val_loss:.3f}). P3'e atlaniyor...")
+            else:
+                print(f"\n  [DIVERGENCE P3] Val Loss patlamasi! ({val_loss:.3f} > 2.5 * {best_val_loss:.3f}). Egitim bitti.")
+                break
 
-    # --- Esik Optimizasyonu (PDF'deki Grid Search) ---
+    # --- SWA BatchNorm guncelle ve kaydet ---
+    if swa_model is not None:
+        print(f"\nSWA BatchNorm guncelleniyor...")
+        # Custom update_bn — dataset 5 eleman donduruyor, update_bn bunu handle edemez
+        swa_model.train()
+        with torch.no_grad():
+            # BN istatistiklerini sifirla
+            for module in swa_model.modules():
+                if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    module.running_mean.zero_()
+                    module.running_var.fill_(1)
+                    module.num_batches_tracked.zero_()
+            
+            # Tum train verisiyle BN istatistiklerini guncelle
+            swa_loader = DataLoader(full_train_dataset if len(full_train_dataset) > len(val_dataset) else val_dataset, 
+                                    batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+            for batch in swa_loader:
+                signals, wide_features_b, _, _, _ = batch
+                signals = signals.to(device)
+                wide_features_b = wide_features_b.to(device)
+                swa_model(signals, wide_features_b)
+        swa_model.eval()
+        swa_path = os.path.join(config.CHECKPOINT_DIR, "swa_model.pth")
+        torch.save(swa_model.module.state_dict(), swa_path)
+        print(f"SWA model kaydedildi: {swa_path}")
+        
+        # SWA modeli ile de validate et
+        _, swa_f1, swa_f1_class, _, _ = validate(swa_model.module, val_loader, criterion_class, device, use_amp)
+        print(f"SWA Val Macro F1: {swa_f1:.4f}")
+        sinif_str = " | ".join(f"{config.LABEL_NAMES[i][:3]}:{swa_f1_class[i]:.3f}" for i in range(5))
+        print(f"SWA Sinif F1: {sinif_str}")
+        
+        # SWA daha iyiyse onu kullan
+        if swa_f1 > best_f1:
+            print(f"SWA modeli daha iyi! ({swa_f1:.4f} > {best_f1:.4f}) -> best_model olarak kaydediliyor")
+            torch.save(swa_model.module.state_dict(), checkpoint_path)
+            best_f1 = swa_f1
+    
+    # --- TTA (Test-Time Augmentation) ile final degerlendirme ---
     print(f"\n{'='*70}")
-    print("Optimal Esik Degerleri Hesaplaniyor...")
+    print("TTA (Test-Time Augmentation) ile Final Degerlendirme...")
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-    _, _, _, y_true, y_prob = validate(model, val_loader, criterion_class, device, use_amp)
-    optimal_thresholds, best_f1s = find_optimal_thresholds(y_true, y_prob, num_classes=config.NUM_CLASSES)
+    model.eval()
+    
+    tta_y_true = []
+    tta_y_prob = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            signals, wide_features, labels, _, _ = batch
+            signals = signals.to(device)
+            wide_features = wide_features.to(device)
+            
+            # Orijinal tahmin
+            all_probs = []
+            if use_amp and device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda'):
+                    logits, _, _ = model(signals, wide_features)
+                    all_probs.append(torch.softmax(logits, dim=1))
+                    
+                    # TTA 1: Zaman ekseninde ters cevir
+                    sig_flip = torch.flip(signals, dims=[2])
+                    logits_flip, _, _ = model(sig_flip, wide_features)
+                    all_probs.append(torch.softmax(logits_flip, dim=1))
+                    
+                    # TTA 2: Hafif gurultu ekle
+                    sig_noise = signals + 0.01 * torch.randn_like(signals)
+                    logits_noise, _, _ = model(sig_noise, wide_features)
+                    all_probs.append(torch.softmax(logits_noise, dim=1))
+                    
+                    # TTA 3: Amplitud olcekleme (0.95x)
+                    sig_scale = signals * 0.95
+                    logits_scale, _, _ = model(sig_scale, wide_features)
+                    all_probs.append(torch.softmax(logits_scale, dim=1))
+                    
+                    # TTA 4: Amplitud olcekleme (1.05x)
+                    sig_scale2 = signals * 1.05
+                    logits_scale2, _, _ = model(sig_scale2, wide_features)
+                    all_probs.append(torch.softmax(logits_scale2, dim=1))
+            else:
+                logits, _, _ = model(signals, wide_features)
+                all_probs.append(torch.softmax(logits, dim=1))
+                
+                sig_flip = torch.flip(signals, dims=[2])
+                logits_flip, _, _ = model(sig_flip, wide_features)
+                all_probs.append(torch.softmax(logits_flip, dim=1))
+                
+                sig_noise = signals + 0.01 * torch.randn_like(signals)
+                logits_noise, _, _ = model(sig_noise, wide_features)
+                all_probs.append(torch.softmax(logits_noise, dim=1))
+                
+                sig_scale = signals * 0.95
+                logits_scale, _, _ = model(sig_scale, wide_features)
+                all_probs.append(torch.softmax(logits_scale, dim=1))
+                
+                sig_scale2 = signals * 1.05
+                logits_scale2, _, _ = model(sig_scale2, wide_features)
+                all_probs.append(torch.softmax(logits_scale2, dim=1))
+            
+            # Tum tahminlerin ortalamasini al
+            avg_probs = torch.stack(all_probs).mean(dim=0)
+            tta_y_true.extend(labels.cpu().numpy())
+            tta_y_prob.extend(avg_probs.cpu().numpy())
+    
+    tta_y_true = np.array(tta_y_true)
+    tta_y_prob = np.array(tta_y_prob)
+    tta_preds = tta_y_prob.argmax(axis=1)
+    tta_f1 = f1_score(tta_y_true, tta_preds, average='macro', zero_division=0)
+    tta_f1_class = f1_score(tta_y_true, tta_preds, average=None, 
+                            labels=list(range(config.NUM_CLASSES)), zero_division=0)
+    
+    sinif_str = " | ".join(f"{config.LABEL_NAMES[i][:3]}:{tta_f1_class[i]:.3f}" for i in range(5))
+    print(f"\nTTA Macro F1 (5 augmentation): {tta_f1:.4f}")
+    print(f"TTA Sinif F1: {sinif_str}")
+
+    # --- Esik Optimizasyonu (TTA olasiliklari uzerinden) ---
+    print(f"\n{'='*70}")
+    print("Optimal Esik Degerleri Hesaplaniyor (TTA uzerinden)...")
+    optimal_thresholds, best_f1s = find_optimal_thresholds(tta_y_true, tta_y_prob, num_classes=config.NUM_CLASSES)
+    
+    th_macro_f1 = np.mean(best_f1s)
+    print(f"\n--- Esik Optimizasyonu Sonuclari ---")
+    for i in range(config.NUM_CLASSES):
+        print(f"{config.LABEL_NAMES[i]:6s} -> Optimal Esik: {optimal_thresholds[i]:.2f} (F1: {best_f1s[i]:.4f})")
+    print(f"Esik Optimizasyonu Sonrasi Macro F1: {th_macro_f1:.4f}")
+    print(f"------------------------------------")
     
     th_path = os.path.join(config.OUTPUT_DIR, "optimal_thresholds.json")
     with open(th_path, 'w') as f:
@@ -519,11 +691,13 @@ def egitim_pipeline():
 
     print(f"\n{'='*70}")
     print(f"EGITIM TAMAMLANDI")
-    print(f"  En iyi Val Macro F1 : {best_f1:.4f}")
-    print(f"  Model               : {checkpoint_path}")
+    print(f"  En iyi Val Macro F1       : {best_f1:.4f}")
+    print(f"  TTA Macro F1              : {tta_f1:.4f}")
+    print(f"  Esik Opt. Macro F1 (TTA)  : {th_macro_f1:.4f}")
+    print(f"  Model                     : {checkpoint_path}")
     print(f"{'='*70}")
 
-    return {"best_f1": best_f1}
+    return {"best_f1": best_f1, "tta_f1": tta_f1, "threshold_f1": th_macro_f1}
 
 
 if __name__ == "__main__":
