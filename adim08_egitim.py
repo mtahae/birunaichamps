@@ -465,7 +465,7 @@ def egitim_pipeline():
             use_mixup = True  # Mixup sadece P2'de aktif
             current_patience = PATIENCE_P2
         else:
-            loader = train_loader_tekno
+            loader = train_loader_all  # P3: Tum veri + donmus backbone = genelleme
             use_dann = False
             alpha = 0.0
             phase_name = "P3-FINE"

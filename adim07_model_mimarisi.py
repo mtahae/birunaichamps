@@ -52,7 +52,7 @@ class EKGAugmentation:
     2. Random crop -> P/T dalgasi kaybolur
     3. Global amplitude scale -> V1/V6 orani bozulur
     """
-    def __init__(self, p=0.8):
+    def __init__(self, p=0.9):  # 0.8 -> 0.9: Daha sik augmentasyon = daha guclu regularizasyon
         self.p = p
 
     def __call__(self, sinyal):
@@ -64,13 +64,13 @@ class EKGAugmentation:
         C, L = sinyal.shape
 
         # 1. Lead-Wise Amplitude Scale (0.9-1.1) — PDF: Her lead bagimsiz
-        if random.random() < 0.5:
+        if random.random() < 0.6:  # 0.5 -> 0.6
             scale = np.random.uniform(0.9, 1.1, size=(C, 1)).astype(np.float32)
             sinyal *= scale
 
         # 2. Gaussian Noise (hafif) — PDF: SNR > 20 dB
-        if random.random() < 0.5:
-            noise = np.random.normal(0, 0.01, sinyal.shape).astype(np.float32)
+        if random.random() < 0.6:  # 0.5 -> 0.6
+            noise = np.random.normal(0, 0.02, sinyal.shape).astype(np.float32)  # 0.01 -> 0.02
             sinyal += noise
 
         # 3. Lead Dropout — PDF: 1-2 lead sifirla
