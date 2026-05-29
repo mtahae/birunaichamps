@@ -189,11 +189,6 @@ WARMUP_EPOCHS = 5
 GRAD_CLIP_MAX_NORM = 1.0
 USE_AMP = True  # Mixed Precision Training
 
-# Deep Research Teknikleri — gelistirilecekyonler.md
-SAM_RHO = 0.05          # SAM komsuluk yaricapi (Sharpness-Aware Minimization)
-LORA_RANK = 4           # LoRA adapter mertebesi (Low-Rank Adaptation)
-LDAM_MAX_MARGIN = 0.5   # LDAM maksimum marj (Label-Distribution-Aware Margin)
-
 
 # =============================================================================
 # DEVICE
