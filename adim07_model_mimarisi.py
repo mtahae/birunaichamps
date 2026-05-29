@@ -29,7 +29,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 import random
-import math
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -53,7 +52,7 @@ class EKGAugmentation:
     2. Random crop -> P/T dalgasi kaybolur
     3. Global amplitude scale -> V1/V6 orani bozulur
     """
-    def __init__(self, p=0.9):  # 0.8 -> 0.9: Daha sik augmentasyon = daha guclu regularizasyon
+    def __init__(self, p=0.8):
         self.p = p
 
     def __call__(self, sinyal):
@@ -65,13 +64,13 @@ class EKGAugmentation:
         C, L = sinyal.shape
 
         # 1. Lead-Wise Amplitude Scale (0.9-1.1) — PDF: Her lead bagimsiz
-        if random.random() < 0.6:  # 0.5 -> 0.6
+        if random.random() < 0.5:
             scale = np.random.uniform(0.9, 1.1, size=(C, 1)).astype(np.float32)
             sinyal *= scale
 
         # 2. Gaussian Noise (hafif) — PDF: SNR > 20 dB
-        if random.random() < 0.6:  # 0.5 -> 0.6
-            noise = np.random.normal(0, 0.02, sinyal.shape).astype(np.float32)  # 0.01 -> 0.02
+        if random.random() < 0.5:
+            noise = np.random.normal(0, 0.01, sinyal.shape).astype(np.float32)
             sinyal += noise
 
         # 3. Lead Dropout — PDF: 1-2 lead sifirla
@@ -91,19 +90,14 @@ class EKGAugmentation:
                     drift = amp * np.sin(2 * np.pi * freq * t + random.uniform(0, 2*np.pi))
                     sinyal[ch] += drift.astype(np.float32)
 
-        # 5. Frequency-Domain Masking — FFT bazli frekans maskeleme
-        #    Time Masking YERINE: P-QRS-T zamansal butunlugunu korur.
-        #    Kaynak: gelistirilecekyonler.md — Frekans Uzayinda Maskeleme
+        # 5. Time Masking — Rastgele bir zaman segmentini sifirla
+        #    SpecAugment'in EKG versiyonu. np.roll veya crop DEGIL, sadece maskeleme.
         if random.random() < 0.4:
-            for ch in range(C):
-                spectrum = np.fft.rfft(sinyal[ch])
-                num_freqs = len(spectrum)
-                n_masks = random.randint(1, 3)  # 1-3 frekans bandi maskele
-                for _ in range(n_masks):
-                    mask_width = random.randint(2, 8)  # Dar bant
-                    mask_start = random.randint(1, max(1, num_freqs - mask_width - 1))
-                    spectrum[mask_start:mask_start + mask_width] = 0
-                sinyal[ch] = np.fft.irfft(spectrum, n=L).astype(np.float32)
+            mask_len = random.randint(50, 250)  # 50-250 sample (0.2-1.0 saniye)
+            max_start = L - mask_len
+            if max_start > 0:
+                start = random.randint(0, max_start)
+                sinyal[:, start:start + mask_len] = 0.0
 
         return sinyal
 
@@ -287,45 +281,6 @@ class ResNetBlock(nn.Module):
         return self.relu(out)
 
 
-
-class LoRAConv1d(nn.Module):
-    """
-    Low-Rank Adaptation for Conv1d — Dondurulmus omurgayi esnetir.
-    Kaynak: gelistirilecekyonler.md — LoRA ile 1D ResNet Esnetmesi
-    
-    Orijinal Conv1d agirliklarini donuk tutar, ustune rank-r adaptorler ekler:
-    W' = W_frozen + lora_up(lora_down(x)) * scaling
-    
-    lora_up sifirla baslatilir -> egitimin basinda delta = 0 -> model degismez.
-    """
-    def __init__(self, original_conv, rank=4):
-        super().__init__()
-        self.original_conv = original_conv
-        for param in self.original_conv.parameters():
-            param.requires_grad = False
-        
-        in_ch = original_conv.in_channels
-        out_ch = original_conv.out_channels
-        kernel_size = original_conv.kernel_size[0]
-        stride = original_conv.stride[0]
-        padding = original_conv.padding[0]
-        
-        # LoRA: Iki kucuk konvolusyon (down-project + up-project)
-        self.lora_down = nn.Conv1d(in_ch, rank, kernel_size=kernel_size,
-                                    stride=stride, padding=padding, bias=False)
-        self.lora_up = nn.Conv1d(rank, out_ch, kernel_size=1, stride=1,
-                                  padding=0, bias=False)
-        
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)  # B=0 -> baslangicta delta=0
-        self.scaling = 1.0 / rank
-    
-    def forward(self, x):
-        original_out = self.original_conv(x)
-        lora_out = self.lora_up(self.lora_down(x)) * self.scaling
-        return original_out + lora_out
-
-
 # =============================================================================
 # ANA MODEL: CARDIOFUSION-5 — PDF Bolum 2 (Versiyon A + B Birlesik)
 # =============================================================================
@@ -459,47 +414,6 @@ class CardioFusion5(nn.Module):
         
         return class_logits, aux_logits, domain_logits
 
-    def enable_lora(self, rank=4):
-        """
-        P3'te cagirilir. CNN backbone Conv1d katmanlarini LoRA ile sarar.
-        Orijinal agirliklar donuk kalir, sadece LoRA adaptorler egitilir.
-        BN katmanlari da dondurulur.
-        Kaynak: gelistirilecekyonler.md — LoRA ile 1D ResNet Esnetmesi
-        """
-        def _replace_conv(module, attr_name, rank):
-            conv = getattr(module, attr_name)
-            if isinstance(conv, nn.Conv1d):
-                setattr(module, attr_name, LoRAConv1d(conv, rank=rank))
-        
-        # Ana conv1'i sar
-        _replace_conv(self, 'conv1', rank)
-        
-        # ResNet bloklarindaki conv'lari sar
-        for layer in [self.layer1, self.layer2, self.layer3, self.layer4]:
-            for block in layer:
-                if isinstance(block, ResNetBlock):
-                    _replace_conv(block, 'conv1', rank)
-                    _replace_conv(block, 'conv2', rank)
-                    if block.downsample is not None:
-                        for i, m in enumerate(block.downsample):
-                            if isinstance(m, nn.Conv1d):
-                                block.downsample[i] = LoRAConv1d(m, rank=rank)
-        
-        # BN katmanlarini dondur (backbone)
-        for name, module in self.named_modules():
-            if isinstance(module, nn.BatchNorm1d):
-                if any(layer in name for layer in ['bn1', 'layer1', 'layer2', 'layer3', 'layer4']):
-                    for param in module.parameters():
-                        param.requires_grad = False
-        
-        # Istatistik
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        lora_params = sum(p.numel() for n, p in self.named_parameters() if 'lora_' in n)
-        print(f"    -> LoRA eklendi (rank={rank})")
-        print(f"    -> LoRA parametreleri: {lora_params:,}")
-        print(f"    -> Egitilebilir: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
-
 
 # =============================================================================
 # FOCAL LOSS — PDF Bolum 6
@@ -537,145 +451,6 @@ class FocalLoss(nn.Module):
             focal_loss = focal_weight * ce_loss
 
         return focal_loss.mean()
-
-
-class LDAMFocalLoss(nn.Module):
-    """
-    LDAM + Focal Loss Hibrit Kayip Fonksiyonu.
-    Kaynak: gelistirilecekyonler.md — LDAM ile Karar Sinirlarinin Genisletilmesi
-    
-    LDAM marji: margin_j = C / n_j^(1/4)
-    - AFL (az ornekli) -> buyuk marj -> karar siniri AFL lehine genisler
-    - Normal (cok ornekli) -> kucuk marj -> degismez
-    
-    Focal Loss ile birlesik:
-    1. LDAM: Geometrik olarak karar sinirlari genisler
-    2. Focal: Kolay orneklerin gradyan katkisi azalir
-    """
-    def __init__(self, class_counts, alpha=None, gamma=2.0, label_smoothing=0.0, max_margin=0.5):
-        super().__init__()
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        
-        # LDAM marjlarini hesapla: margin_j = C / n_j^(1/4)
-        counts = np.array(class_counts, dtype=np.float32)
-        margins = 1.0 / np.power(counts, 0.25)
-        margins = margins * (max_margin / margins.max())  # max_margin'a normalize et
-        self.register_buffer('margins', torch.FloatTensor(margins))
-        
-        if alpha is not None:
-            if isinstance(alpha, torch.Tensor):
-                self.register_buffer('alpha', alpha)
-            else:
-                self.register_buffer('alpha', torch.FloatTensor(alpha))
-        else:
-            self.alpha = None
-    
-    def forward(self, logits, targets):
-        # LDAM: Gercek sinifin logit'inden marji cikar
-        margin_for_targets = self.margins[targets]
-        adjusted_logits = logits.clone()
-        adjusted_logits[torch.arange(logits.size(0), device=logits.device), targets] -= margin_for_targets
-        
-        # Focal Loss (LDAM-ayarli logitler uzerinden)
-        ce_loss = F.cross_entropy(adjusted_logits, targets, reduction='none',
-                                   label_smoothing=self.label_smoothing)
-        pt = torch.exp(-ce_loss)
-        focal_weight = (1 - pt) ** self.gamma
-        
-        if self.alpha is not None:
-            alpha_t = self.alpha[targets]
-            focal_loss = alpha_t * focal_weight * ce_loss
-        else:
-            focal_loss = focal_weight * ce_loss
-        
-        return focal_loss.mean()
-
-
-class UncertaintyWeightedLoss(nn.Module):
-    """
-    Homoskedastik Belirsizlik Agirliklama — Multi-Task Loss icin.
-    Kaynak: gelistirilecekyonler.md — Kendall Uncertainty Weighting
-    
-    Her gorev kendi sigma^2 parametresini ogrenerek, gurultulu
-    gorevlerin (AFL gibi) ana optimizasyonu bozmasini onler.
-    
-    L_total = sum_k [ exp(-s_k) * L_k + s_k ]
-    """
-    def __init__(self, num_tasks=3):
-        super().__init__()
-        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
-    
-    def forward(self, *losses):
-        total = 0
-        for i, loss in enumerate(losses):
-            precision = torch.exp(-self.log_vars[i])
-            total = total + precision * loss + self.log_vars[i]
-        return total
-
-
-class SAM(torch.optim.Optimizer):
-    """
-    Sharpness-Aware Minimization (SAM) Optimizer.
-    Kaynak: gelistirilecekyonler.md — SAM ile Duz Minima Optimizasyonu
-    
-    Her iterasyonda 2x forward/backward yaparak kayip yuzeyinde
-    duz vadiler bulur. Test genellemesini dramatik artirir.
-    
-    Kullanim:
-        optimizer = SAM(model.parameters(), torch.optim.AdamW, lr=..., rho=0.05)
-        # Adim 1: loss.backward() + optimizer.first_step()
-        # Adim 2: loss.backward() + optimizer.second_step()
-    """
-    def __init__(self, params, base_optimizer_cls, rho=0.05, **kwargs):
-        defaults = dict(rho=rho)
-        super(SAM, self).__init__(params, defaults)
-        self.base_optimizer = base_optimizer_cls(self.param_groups, **kwargs)
-        self.param_groups = self.base_optimizer.param_groups
-        self.defaults.update(self.base_optimizer.defaults)
-    
-    @torch.no_grad()
-    def first_step(self, zero_grad=False):
-        """Adversarial adim: w + epsilon (en kotu durum noktasi)"""
-        grad_norm = self._grad_norm()
-        for group in self.param_groups:
-            scale = group["rho"] / (grad_norm + 1e-12)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                e_w = p.grad * scale
-                p.add_(e_w)
-                self.state[p]["e_w"] = e_w
-        if zero_grad:
-            self.zero_grad()
-    
-    @torch.no_grad()
-    def second_step(self, zero_grad=False):
-        """Optimizasyon adimi: w geri don + base optimizer ile guncelle"""
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                p.sub_(self.state[p]["e_w"])
-        self.base_optimizer.step()
-        if zero_grad:
-            self.zero_grad()
-    
-    def _grad_norm(self):
-        shared_device = self.param_groups[0]["params"][0].device
-        norm = torch.norm(
-            torch.stack([
-                p.grad.norm(p=2).to(shared_device)
-                for group in self.param_groups
-                for p in group["params"]
-                if p.grad is not None
-            ]),
-            p=2
-        )
-        return norm
-    
-    def step(self, closure=None):
-        raise NotImplementedError("SAM icin first_step() ve second_step() kullanin.")
 
 
 # =============================================================================

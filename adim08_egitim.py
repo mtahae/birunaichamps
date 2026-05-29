@@ -28,10 +28,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from adim07_model_mimarisi import (
-    CardioFusion5, EKGDataset, FocalLoss, LDAMFocalLoss,
-    UncertaintyWeightedLoss, SAM, model_ozetini_yazdir
-)
+from adim07_model_mimarisi import CardioFusion5, EKGDataset, FocalLoss, model_ozetini_yazdir
 from threshold_opt import find_optimal_thresholds
 from torch.optim.swa_utils import AveragedModel, SWALR
 
@@ -128,8 +125,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 # =============================================================================
 
 def train_one_epoch(model, loader, criterion_class, criterion_aux, criterion_domain, 
-                    optimizer, scaler, device, use_amp, use_dann=False, alpha=1.0, use_mixup=False,
-                    uncertainty_loss=None, use_sam=False):
+                    optimizer, scaler, device, use_amp, use_dann=False, alpha=1.0, use_mixup=False):
     model.train()
     toplam_class_loss = 0
     tum_tahminler = []
@@ -152,43 +148,7 @@ def train_one_epoch(model, loader, criterion_class, criterion_aux, criterion_dom
 
         optimizer.zero_grad()
 
-        if use_sam:
-            # === SAM Two-Step (P3, AMP deaktif) ===
-            # Adim 1: Forward + Backward -> Adversarial perturbation
-            class_logits, aux_logits, domain_logits = model(signals, wide_features, alpha)
-            loss_class = criterion_class(class_logits, labels)
-            loss_aux = criterion_aux(aux_logits, aux_labels)
-            if uncertainty_loss is not None:
-                if use_dann:
-                    domain_binary = (domains > 0).long()
-                    loss_domain = criterion_domain(domain_logits, domain_binary)
-                    loss = uncertainty_loss(loss_class, loss_aux, loss_domain)
-                else:
-                    loss = uncertainty_loss(loss_class, loss_aux)
-            else:
-                loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
-            optimizer.first_step(zero_grad=True)
-            
-            # Adim 2: Forward + Backward at perturbed weights -> Update
-            class_logits, aux_logits, domain_logits = model(signals, wide_features, alpha)
-            loss_class = criterion_class(class_logits, labels)
-            loss_aux = criterion_aux(aux_logits, aux_labels)
-            if uncertainty_loss is not None:
-                if use_dann:
-                    domain_binary = (domains > 0).long()
-                    loss_domain = criterion_domain(domain_logits, domain_binary)
-                    loss = uncertainty_loss(loss_class, loss_aux, loss_domain)
-                else:
-                    loss = uncertainty_loss(loss_class, loss_aux)
-            else:
-                loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
-            optimizer.second_step(zero_grad=True)
-
-        elif use_amp and device.type == 'cuda':
+        if use_amp and device.type == 'cuda':
             with torch.amp.autocast(device_type='cuda'):
                 class_logits, aux_logits, domain_logits = model(signals, wide_features, alpha)
                 
@@ -201,21 +161,13 @@ def train_one_epoch(model, loader, criterion_class, criterion_aux, criterion_dom
                 # Aux Loss
                 loss_aux = criterion_aux(aux_logits, aux_labels)
                 
-                # Loss Combination (Uncertainty Weighting veya statik)
-                if uncertainty_loss is not None:
-                    if use_dann:
-                        domain_binary = (domains > 0).long()
-                        loss_domain = criterion_domain(domain_logits, domain_binary)
-                        loss = uncertainty_loss(loss_class, loss_aux, loss_domain)
-                    else:
-                        loss = uncertainty_loss(loss_class, loss_aux)
+                # Domain Loss (DANN)
+                if use_dann:
+                    domain_binary = (domains > 0).long()
+                    loss_domain = criterion_domain(domain_logits, domain_binary)
+                    loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux + config.DANN_LAMBDA * loss_domain
                 else:
-                    if use_dann:
-                        domain_binary = (domains > 0).long()
-                        loss_domain = criterion_domain(domain_logits, domain_binary)
-                        loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux + config.DANN_LAMBDA * loss_domain
-                    else:
-                        loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
+                    loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
                     
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -229,20 +181,12 @@ def train_one_epoch(model, loader, criterion_class, criterion_aux, criterion_dom
             else:
                 loss_class = criterion_class(class_logits, labels)
             loss_aux = criterion_aux(aux_logits, aux_labels)
-            if uncertainty_loss is not None:
-                if use_dann:
-                    domain_binary = (domains > 0).long()
-                    loss_domain = criterion_domain(domain_logits, domain_binary)
-                    loss = uncertainty_loss(loss_class, loss_aux, loss_domain)
-                else:
-                    loss = uncertainty_loss(loss_class, loss_aux)
+            if use_dann:
+                domain_binary = (domains > 0).long()
+                loss_domain = criterion_domain(domain_logits, domain_binary)
+                loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux + config.DANN_LAMBDA * loss_domain
             else:
-                if use_dann:
-                    domain_binary = (domains > 0).long()
-                    loss_domain = criterion_domain(domain_logits, domain_binary)
-                    loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux + config.DANN_LAMBDA * loss_domain
-                else:
-                    loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
+                loss = loss_class + config.AUX_LOSS_WEIGHT * loss_aux
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP_MAX_NORM)
             optimizer.step()
@@ -378,30 +322,14 @@ def egitim_pipeline():
         class_weights = np.load(class_weights_path)
     else:
         class_weights = np.ones(config.NUM_CLASSES, dtype=np.float32)
-    
-    # Sinif sayilari (LDAM marj hesabi icin)
-    class_counts_for_ldam = [sinif_dag.get(idx, 1) for idx in range(config.NUM_CLASSES)]
-    print(f"\n  LDAM Marjlari icin sinif sayilari: {class_counts_for_ldam}")
-    
-    criterion_class = LDAMFocalLoss(
-        class_counts=class_counts_for_ldam,
-        alpha=class_weights, 
-        gamma=config.FOCAL_LOSS_GAMMA, 
-        label_smoothing=config.LABEL_SMOOTHING,
-        max_margin=config.LDAM_MAX_MARGIN
-    ).to(device)
+        
+    criterion_class = FocalLoss(alpha=class_weights, gamma=config.FOCAL_LOSS_GAMMA, 
+                                label_smoothing=config.LABEL_SMOOTHING).to(device)
     criterion_aux = nn.CrossEntropyLoss().to(device)
     criterion_domain = nn.CrossEntropyLoss().to(device)
     
-    # Uncertainty Weighting (Multi-Task Loss icin dinamik agirliklar)
-    uncertainty_loss = UncertaintyWeightedLoss(num_tasks=3).to(device)
-    print(f"  Uncertainty Weighting: AKTIF (3 gorev: main, aux, domain)")
-    
-    # --- Optimizer (model + uncertainty parametreleri) ---
-    optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(uncertainty_loss.parameters()),
-        lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
-    )
+    # --- Optimizer (scheduler her asama icin ayri ayarlanacak) ---
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     scaler = torch.amp.GradScaler() if use_amp else None
 
     # --- Curriculum Asamalari (config'den) ---
@@ -425,12 +353,12 @@ def egitim_pipeline():
 
     print(f"\n  Egitim Parametreleri:")
     print(f"    Optimizer      : AdamW (lr={config.LEARNING_RATE}, wd={config.WEIGHT_DECAY})")
-    print(f"    Loss           : LDAMFocalLoss(g={config.FOCAL_LOSS_GAMMA}, m={config.LDAM_MAX_MARGIN}) + UncertaintyMTL + Mixup(P2)")
+    print(f"    Loss           : FocalLoss(g={config.FOCAL_LOSS_GAMMA}) + AuxCE(w={config.AUX_LOSS_WEIGHT}) + Mixup(P2)")
     print(f"    Batch Size     : {config.BATCH_SIZE}")
     print(f"    Total Epochs   : {TOTAL_EPOCHS}")
     print(f"    Phase 1 (Tekno): 1-{P1} (patience={PATIENCE_P1})")
     print(f"    Phase 2 (Karma): {P1+1}-{P1+P2} (patience={PATIENCE_P2}, Mixup+DANN)")
-    print(f"    Phase 3 (Fine) : {P1+P2+1}-{TOTAL_EPOCHS} (patience={PATIENCE_P3}, SAM+LoRA)")
+    print(f"    Phase 3 (Fine) : {P1+P2+1}-{TOTAL_EPOCHS} (patience={PATIENCE_P3}, SWA aktif)")
     print(f"    Mixed Precision: {'Evet' if use_amp else 'Hayir'}")
     print(f"\n{'='*70}\n  EGITIM BASLIYOR...\n{'='*70}\n")
 
@@ -483,35 +411,34 @@ def egitim_pipeline():
                 print(f"    -> P2 LR={p2_lr:.6f} | Patience sifirlandi | Cosine T_max={P2} | Mixup+DANN aktif")
                 
             elif new_phase == 3:
-                # P3: Best modeli yukle + LoRA + SAM
+                # P3: Best modeli yukle + cok dusuk LR
                 print(f"\n  [PHASE CHANGE] P2 -> P3 | En iyi model yukleniyor (VF1={best_f1:.4f})")
                 if os.path.exists(checkpoint_path):
                     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
                     print(f"    -> best_model.pth yuklendi.")
                 
-                # LoRA: CNN omurgasini esnet (tam dondurma yerine)
-                model.enable_lora(rank=config.LORA_RANK)
-                
-                # SAM Optimizer (duz minima bulmak icin)
-                p3_lr = config.LEARNING_RATE * 0.05
-                trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
-                trainable_params += list(uncertainty_loss.parameters())
-                optimizer = SAM(
-                    trainable_params,
-                    torch.optim.AdamW,
-                    lr=p3_lr,
-                    weight_decay=config.WEIGHT_DECAY,
-                    rho=config.SAM_RHO
-                )
+                p3_lr = config.LEARNING_RATE * 0.05  # %5 LR ile ince ayar
+                for pg in optimizer.param_groups:
+                    pg['lr'] = p3_lr
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer.base_optimizer, T_max=P3, eta_min=1e-7)
+                    optimizer, T_max=P3, eta_min=1e-7)
                 patience_counter = 0
                 
-                # SWA DEAKTIF — SAM ile uyumsuz (arastirma bulgulari)
-                swa_model = None
-                swa_scheduler = None
+                # P3 BACKBONE FREEZE — Sadece Transformer + Classifier egitilir
+                # CNN backbone'u dondur (genel EKG paternlerini korumak icin)
+                frozen_count = 0
+                for name, param in model.named_parameters():
+                    if any(layer in name for layer in ['conv1.', 'bn1.', 'layer1.', 'layer2.', 'layer3.', 'layer4.']):
+                        param.requires_grad = False
+                        frozen_count += 1
+                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"    -> CNN Backbone DONDURULDU ({frozen_count} parametre grubu)")
+                print(f"    -> Egitilebilir parametre: {trainable:,} (Transformer + Classifier)")
                 
-                print(f"    -> P3 LR={p3_lr:.6f} | SAM(rho={config.SAM_RHO}) | LoRA(rank={config.LORA_RANK})")
+                # SWA baslat — P3'te agirlik ortalaması ile daha iyi genelleme
+                swa_model = AveragedModel(model).to(device)
+                swa_scheduler = SWALR(optimizer, swa_lr=p3_lr * 0.5, anneal_epochs=5)
+                print(f"    -> P3 LR={p3_lr:.6f} | Patience sifirlandi | SWA aktif")
                 
             current_phase = new_phase
 
@@ -538,7 +465,7 @@ def egitim_pipeline():
             use_mixup = True  # Mixup sadece P2'de aktif
             current_patience = PATIENCE_P2
         else:
-            loader = train_loader_all  # P3: Tum veri + donmus backbone = genelleme
+            loader = train_loader_tekno
             use_dann = False
             alpha = 0.0
             phase_name = "P3-FINE"
@@ -546,11 +473,9 @@ def egitim_pipeline():
             current_patience = PATIENCE_P3
 
         # --- Train ---
-        use_sam_flag = (current_phase == 3)
         train_loss, train_f1 = train_one_epoch(
             model, loader, criterion_class, criterion_aux, criterion_domain,
-            optimizer, scaler, device, use_amp, use_dann, alpha, use_mixup,
-            uncertainty_loss=uncertainty_loss, use_sam=use_sam_flag
+            optimizer, scaler, device, use_amp, use_dann, alpha, use_mixup
         )
 
         # --- Validate ---
@@ -671,7 +596,7 @@ def egitim_pipeline():
     # --- TTA (Test-Time Augmentation) ile final degerlendirme ---
     print(f"\n{'='*70}")
     print("TTA (Test-Time Augmentation) ile Final Degerlendirme...")
-    model.load_state_dict(torch.load(checkpoint_path, weights_only=True), strict=False)
+    model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     model.eval()
     
     tta_y_true = []
