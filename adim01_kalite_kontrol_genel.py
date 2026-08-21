@@ -30,6 +30,7 @@ import hashlib
 import numpy as np
 import pandas as pd
 import wfdb
+import h5py
 from tqdm import tqdm
 from collections import Counter
 
@@ -54,8 +55,12 @@ def sinyal_hash(signal_path, max_samples=2500):
         str: MD5 hash veya None (okunamazsa)
     """
     try:
-        rec = wfdb.rdsamp(signal_path)
-        sinyal = rec[0]  # (zaman_adimi, kanal_sayisi)
+        if str(signal_path).endswith('.h5'):
+            with h5py.File(signal_path, 'r') as f:
+                sinyal = f['ecg'][:].astype(np.float32).T  # wfdb benzeri format icin devrik al
+        else:
+            rec = wfdb.rdsamp(signal_path)
+            sinyal = rec[0]  # (zaman_adimi, kanal_sayisi)
 
         # Ilk max_samples ornegi al (hiz icin)
         snippet = sinyal[:max_samples, :].tobytes()
@@ -109,9 +114,16 @@ def kalite_kontrol_genel():
         ecg_id = row['ecg_id']
 
         try:
-            rec = wfdb.rdsamp(signal_path)
-            sinyal = rec[0]
-            meta = rec[1]
+            if str(signal_path).endswith('.h5'):
+                with h5py.File(signal_path, 'r') as f:
+                    sinyal_h5 = f['ecg'][:].astype(np.float32)  # (12, N)
+                    sinyal = sinyal_h5.T  # (N, 12) formatina cevir ki shape[1]==12 kontrolu calissin
+                fs = 500  # records dataseti 500 hz
+            else:
+                rec = wfdb.rdsamp(signal_path)
+                sinyal = rec[0]
+                meta = rec[1]
+                fs = meta.get('fs', 500)
 
             # Lead sayisi kontrolu
             if sinyal.shape[1] != 12:
@@ -120,7 +132,6 @@ def kalite_kontrol_genel():
                 continue
 
             # Fs kontrolu
-            fs = meta.get('fs', 500)
             if fs != 500:
                 yanlis_fs.append((ecg_id, fs))
 

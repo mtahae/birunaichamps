@@ -52,7 +52,7 @@ class EKGAugmentation:
     2. Random crop -> P/T dalgasi kaybolur
     3. Global amplitude scale -> V1/V6 orani bozulur
     """
-    def __init__(self, p=0.8):
+    def __init__(self, p=0.9):  # 0.8 -> 0.9: overfit'e karsi daha sik augment
         self.p = p
 
     def __call__(self, sinyal):
@@ -73,8 +73,8 @@ class EKGAugmentation:
             noise = np.random.normal(0, 0.01, sinyal.shape).astype(np.float32)
             sinyal += noise
 
-        # 3. Lead Dropout — PDF: 1-2 lead sifirla
-        if random.random() < 0.3:
+        # 3. Lead Dropout — PDF: 1-2 lead sifirla (0.3 -> 0.4: lead ezberini kirar)
+        if random.random() < 0.4:
             n_dropout = random.choice([1, 2])
             dropout_leads = np.random.choice(C, size=n_dropout, replace=False)
             for ch in dropout_leads:
@@ -92,12 +92,16 @@ class EKGAugmentation:
 
         # 5. Time Masking — Rastgele bir zaman segmentini sifirla
         #    SpecAugment'in EKG versiyonu. np.roll veya crop DEGIL, sadece maskeleme.
-        if random.random() < 0.4:
+        if random.random() < 0.5:
             mask_len = random.randint(50, 250)  # 50-250 sample (0.2-1.0 saniye)
             max_start = L - mask_len
             if max_start > 0:
                 start = random.randint(0, max_start)
                 sinyal[:, start:start + mask_len] = 0.0
+
+        # 6. Signal Inversion — Kablo ters baglama simulasyonu
+        if random.random() < 0.05:
+            sinyal = -sinyal
 
         return sinyal
 
@@ -282,21 +286,111 @@ class ResNetBlock(nn.Module):
 
 
 # =============================================================================
-# ANA MODEL: CARDIOFUSION-5 — PDF Bolum 2 (Versiyon A + B Birlesik)
+# ANA MODEL: CARDIOFUSION-5 v2 — Multi-Scale + Rhythm Branch + Attention Pooling
 # =============================================================================
+
+class MultiScaleCNN(nn.Module):
+    """
+    Multi-Scale CNN: 3 paralel kernel (3, 7, 15) ile farkli olceklerdeki 
+    ozellikleri ayni anda yakalar.
+    - Kernel 3: QRS spike'lari (hizli degisimler)
+    - Kernel 7: P-T dalgalari (orta vadeli)
+    - Kernel 15: RR araliklari (uzun vadeli paternler)
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        branch_ch = out_channels // 3  # Her dal esit kanal
+        remainder = out_channels - branch_ch * 3  # Kalan kanallari son dala ver
+        
+        self.branch_3 = nn.Sequential(
+            nn.Conv1d(in_channels, branch_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(branch_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.branch_7 = nn.Sequential(
+            nn.Conv1d(in_channels, branch_ch, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(branch_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.branch_15 = nn.Sequential(
+            nn.Conv1d(in_channels, branch_ch + remainder, kernel_size=15, padding=7, bias=False),
+            nn.BatchNorm1d(branch_ch + remainder),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        b3 = self.branch_3(x)
+        b7 = self.branch_7(x)
+        b15 = self.branch_15(x)
+        return torch.cat([b3, b7, b15], dim=1)
+
+
+class RhythmBranch(nn.Module):
+    """
+    Rhythm Branch: Sadece Lead II (idx=1), III (idx=2), aVF (idx=5) kullanarak
+    P-dalgasina odaklanan ayri bir CNN kolu.
+    
+    AFIB'de P dalgasi YOKTUR, Normal'de VARDIR.
+    AFL'de testere disi flutter wave vardir.
+    Bu dal bu ayrimi direkt ogrenir.
+    """
+    def __init__(self, out_dim=64):
+        super().__init__()
+        # 3 lead girisi
+        self.conv1 = nn.Conv1d(3, 32, kernel_size=15, stride=2, padding=7, bias=False)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.conv3 = nn.Conv1d(64, out_dim, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn3 = nn.BatchNorm1d(out_dim)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, x_12lead):
+        """x_12lead: (batch, 12, 2500)"""
+        # Lead II=1, Lead III=2, aVF=5
+        rhythm_leads = x_12lead[:, [1, 2, 5], :]  # (batch, 3, 2500)
+        out = F.relu(self.bn1(self.conv1(rhythm_leads)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = F.relu(self.bn3(self.conv3(out)))
+        out = self.pool(out).squeeze(-1)  # (batch, out_dim)
+        return self.dropout(out)
+
+
+class AttentionPooling(nn.Module):
+    """
+    Attention Pooling: Her zaman adiminin onemini ogrenen pooling.
+    AdaptiveAvgPool'dan farkli olarak QRS ani gibi onemli anlara
+    daha fazla agirlik verir.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.Tanh(),
+            nn.Linear(dim // 4, 1)
+        )
+    
+    def forward(self, x):
+        """x: (batch, seq_len, dim) — Transformer ciktisi"""
+        attn_weights = self.attention(x)  # (batch, seq_len, 1)
+        attn_weights = F.softmax(attn_weights, dim=1)  # Normalize
+        weighted = (x * attn_weights).sum(dim=1)  # (batch, dim)
+        return weighted
+
 
 class CardioFusion5(nn.Module):
     """
-    CardioFusion-5 Unified Model
+    CardioFusion-5 v2 — 0.86+ Macro F1 hedefli upgrade
     
-    PDF'deki her iki versiyonun (Efficient + Pro) en iyi ozelliklerini birlestirir:
-    - SE-ResNet Feature Extractor (Versiyon A — CNN + SE)
-    - Transformer Encoder (Versiyon B — Zamansal)
-    - Wide Features (Versiyon A — Precomputed fizyolojik)
-    - DANN (Versiyon B — Domain Adversarial)
-    - Multi-Task Loss (Her iki versiyon — 5+3 sinif)
+    Yeni ozellikler:
+    - Multi-Scale CNN (kernel 3, 7, 15 paralel dallar)
+    - Rhythm Branch (Lead II, III, aVF icin ayri CNN)
+    - Attention Pooling (AdaptiveAvgPool yerine)
+    - DANN + Multi-Task (mevcut)
+    - Wide Features 12-dim (P-dalga ozellikleri eklendi)
     """
-    def __init__(self, num_classes=5, num_aux_classes=3, num_domains=2, wide_feature_dim=8):
+    def __init__(self, num_classes=5, num_aux_classes=3, num_domains=2, wide_feature_dim=12):
         super().__init__()
         
         # 1. Feature Extractor (SE-ResNet)
@@ -311,7 +405,10 @@ class CardioFusion5(nn.Module):
         self.layer3 = self._make_layer(256, 2, kernel_size=7, stride=2)
         self.layer4 = self._make_layer(config.TRANSFORMER_DIM, 2, kernel_size=7, stride=2)
         
-        # 2. Transformer Encoder
+        # 2. Multi-Scale CNN — Transformer oncesi
+        self.multi_scale = MultiScaleCNN(config.TRANSFORMER_DIM, config.TRANSFORMER_DIM)
+        
+        # 3. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.TRANSFORMER_DIM,
             nhead=config.TRANSFORMER_HEADS,
@@ -319,25 +416,33 @@ class CardioFusion5(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.TRANSFORMER_LAYERS)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        # 3. Main Classifier (Deep + Wide) — PDF: Dense(128) -> Dense(5)
+        # 4. Attention Pooling (AdaptiveAvgPool yerine)
+        self.attention_pool = AttentionPooling(config.TRANSFORMER_DIM)
+        
+        # 5. Rhythm Branch (Lead II, III, aVF)
+        self.rhythm_branch = RhythmBranch(out_dim=64)
+        
+        # 6. Main Classifier (Deep + Rhythm + Wide)
+        # CNN(384) + Rhythm(64) + Wide(12) = 460 -> 128 -> 5
         self.fc_deep = nn.Linear(config.TRANSFORMER_DIM, 128)
-        self.fc_deep_drop = nn.Dropout(0.2)  # Deep features dropout
+        self.fc_deep_drop = nn.Dropout(0.2)
         
-        # Wide Features normalizasyonu — overfitting onleme
+        # Wide Features normalizasyonu
         self.wide_bn = nn.BatchNorm1d(wide_feature_dim)
         self.wide_drop = nn.Dropout(0.3)
         
+        # Rhythm Branch normalizasyonu
+        self.rhythm_bn = nn.BatchNorm1d(64)
+        
         self.classifier = nn.Sequential(
-            nn.Linear(128 + wide_feature_dim, 64),
+            nn.Linear(128 + 64 + wide_feature_dim, 64),  # Deep + Rhythm + Wide
             nn.ReLU(),
             nn.Dropout(0.4),
             nn.Linear(64, num_classes)
         )
         
-        # 4. Auxiliary Classifier (Multi-Task) — PDF Bolum 8
-        # 3-sinif: Normal / Ritim Bozuklugu / Iletim Bozuklugu
+        # 7. Auxiliary Classifier (Multi-Task)
         self.aux_classifier = nn.Sequential(
             nn.Linear(config.TRANSFORMER_DIM, 64),
             nn.ReLU(),
@@ -345,7 +450,7 @@ class CardioFusion5(nn.Module):
             nn.Linear(64, num_aux_classes)
         )
         
-        # 5. Domain Classifier (DANN) — PDF Versiyon B
+        # 8. Domain Classifier (DANN)
         self.domain_classifier = nn.Sequential(
             nn.Linear(config.TRANSFORMER_DIM, 64),
             nn.ReLU(),
@@ -371,44 +476,51 @@ class CardioFusion5(nn.Module):
         """
         Args:
             x: (batch, 12, 2500) — EKG sinyali
-            wide_features: (batch, 8) — Fizyolojik ozellikler
+            wide_features: (batch, 12) — Fizyolojik ozellikler (12-dim)
             alpha: DANN gradient reversal katsayisi
             
         Returns:
-            class_logits: (batch, 5) — Ana sinif tahminleri
-            aux_logits: (batch, 3) — Yardimci sinif (Ritim/Iletim/Normal)
-            domain_logits: (batch, 2) — Domain tahmini
+            class_logits: (batch, 5)
+            aux_logits: (batch, 3)
+            domain_logits: (batch, 2)
         """
-        # CNN
-        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+        # Rhythm Branch — 12 lead'den Lead II, III, aVF sec
+        rhythm_out = self.rhythm_branch(x)  # (batch, 64)
+        
+        # CNN Backbone
+        feat = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        feat = self.layer1(feat)
+        feat = self.layer2(feat)
+        feat = self.layer3(feat)
+        feat = self.layer4(feat)  # (batch, 384, T)
+        
+        # Multi-Scale CNN
+        feat = self.multi_scale(feat)  # (batch, 384, T)
         
         # Transformer
-        x = x.permute(0, 2, 1)
-        x = self.transformer(x)
-        x = x.permute(0, 2, 1)
+        feat = feat.permute(0, 2, 1)  # (batch, T, 384)
+        feat = self.transformer(feat)  # (batch, T, 384)
         
-        # Pooling
-        deep_features = self.global_pool(x).squeeze(-1)  # (batch, 384)
+        # Attention Pooling
+        deep_features = self.attention_pool(feat)  # (batch, 384)
         
-        # Auxiliary Classification (Multi-Task) — dogrudan deep_features'tan
+        # Auxiliary Classification (Multi-Task)
         aux_logits = self.aux_classifier(deep_features)
         
-        # Domain Classification (DANN — Gradient Reversal)
+        # Domain Classification (DANN)
         domain_features = grad_reverse(deep_features, alpha)
         domain_logits = self.domain_classifier(domain_features)
         
-        # Main Classification (Deep + Wide)
-        deep_out = self.fc_deep_drop(F.relu(self.fc_deep(deep_features)))
+        # Main Classification (Deep + Rhythm + Wide)
+        deep_out = self.fc_deep_drop(F.relu(self.fc_deep(deep_features)))  # (batch, 128)
+        rhythm_norm = self.rhythm_bn(rhythm_out)  # (batch, 64)
+        
         if wide_features is not None:
-            wide_norm = self.wide_drop(self.wide_bn(wide_features))  # BN + Dropout
-            combined = torch.cat([deep_out, wide_norm], dim=1)
+            wide_norm = self.wide_drop(self.wide_bn(wide_features))
+            combined = torch.cat([deep_out, rhythm_norm, wide_norm], dim=1)
         else:
-            dummy_wide = torch.zeros(deep_out.size(0), config.WIDE_FEATURE_DIM, device=deep_out.device)
-            combined = torch.cat([deep_out, dummy_wide], dim=1)
+            dummy_wide = torch.zeros(deep_out.size(0), self.classifier[0].in_features - 128 - 64, device=deep_out.device)
+            combined = torch.cat([deep_out, rhythm_norm, dummy_wide], dim=1)
             
         class_logits = self.classifier(combined)
         
@@ -439,7 +551,12 @@ class FocalLoss(nn.Module):
         else:
             self.alpha = None
 
-    def forward(self, logits, targets):
+    def forward(self, logits, targets, reduction='mean'):
+        """
+        reduction='mean' -> skaler (varsayilan, validate icin)
+        reduction='none' -> (batch,) per-sample loss. Hard Example Mining icin
+            her ornege ayri agirlik uygulanabilsin diye gerekli.
+        """
         ce_loss = F.cross_entropy(logits, targets, reduction='none', label_smoothing=self.label_smoothing)
         pt = torch.exp(-ce_loss)
         focal_weight = (1 - pt) ** self.gamma
@@ -450,6 +567,8 @@ class FocalLoss(nn.Module):
         else:
             focal_loss = focal_weight * ce_loss
 
+        if reduction == 'none':
+            return focal_loss
         return focal_loss.mean()
 
 
@@ -475,7 +594,7 @@ def model_ozetini_yazdir(model):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("BirunAI -- CardioFusion-5 Mimari Testi (Aux Head + DANN)")
+    print("BirunAI -- CardioFusion-5 v2 Mimari Testi")
     print("=" * 70)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -483,10 +602,11 @@ if __name__ == "__main__":
     model_ozetini_yazdir(model)
 
     dummy_input = torch.randn(4, 12, 2500).to(device)
-    dummy_wide = torch.randn(4, 8).to(device)
+    dummy_wide = torch.randn(4, 12).to(device)  # 12-dim wide features
     
     class_logits, aux_logits, domain_logits = model(dummy_input, dummy_wide, alpha=0.1)
     print(f"\n  Main   Logits: {class_logits.shape} (Beklenen: 4, 5)")
     print(f"  Aux    Logits: {aux_logits.shape} (Beklenen: 4, 3)")
     print(f"  Domain Logits: {domain_logits.shape} (Beklenen: 4, 2)")
     print("\n  Mimari testi BASARILI!")
+

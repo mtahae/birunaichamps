@@ -17,7 +17,7 @@ import os
 import sys
 import json
 import threading
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -25,6 +25,27 @@ import config
 app = Flask(__name__)
 
 LOG_PATH = os.path.join(config.OUTPUT_DIR, "training_log.json")
+
+
+def find_latest_log():
+    """
+    outputs/ altindaki tum training_log*.json dosyalarini tarar, en son
+    GUNCELLENEN (mtime) dosyayi dondurur. Boylece yeni bir egitim (--tag ile)
+    baslatildiginda dashboard'a hicbir sey yazmadan otomatik ona gecilir —
+    "aktif" egitim her zaman en son yazilan log demektir.
+    """
+    import glob
+    candidates = glob.glob(os.path.join(config.OUTPUT_DIR, "training_log*.json"))
+    if not candidates:
+        return LOG_PATH, None
+    latest = max(candidates, key=os.path.getmtime)
+    fname = os.path.basename(latest)
+    # training_log.json -> tag=None (varsayilan) | training_log_seed123.json -> "seed123"
+    if fname == "training_log.json":
+        tag = None
+    else:
+        tag = fname[len("training_log_"):-len(".json")]
+    return latest, tag
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="tr">
@@ -405,11 +426,29 @@ function updateDashboard(data) {
      last.patience_counter >= 10 ? '🟡 Dikkat' : '🟢 Stabil');
 }
 
+// ?run=seed123 verilirse O run'a SABITLENIR. Verilmezse backend otomatik olarak
+// en son GUNCELLENEN egitimi bulur — yeni bir egitim baslatinca hicbir sey
+// yapmadan dashboard kendiliginden ona gecer.
+const urlParams = new URLSearchParams(window.location.search);
+const pinnedRun = urlParams.get('run');
+const statusUrl = pinnedRun ? ('/api/status?run=' + encodeURIComponent(pinnedRun)) : '/api/status';
+let lastShownRun = null;
+
+function updateActiveRunLabel(activeRun) {
+  if (activeRun === lastShownRun) return;
+  lastShownRun = activeRun;
+  const label = activeRun ? activeRun : 'varsayılan';
+  document.title = 'BirunAI — ' + label;
+  const h1 = document.querySelector('.header h1');
+  if (h1) h1.textContent = '⚡ BirunAI — EKG Eğitim Dashboard [' + label + (pinnedRun ? ' (sabit)' : ' — otomatik') + ']';
+}
+
 // 2 saniyede bir guncelle
 async function fetchData() {
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch(statusUrl);
     const data = await res.json();
+    updateActiveRunLabel(data._active_run);
     updateDashboard(data);
   } catch(e) {}
 }
@@ -441,15 +480,26 @@ def index():
 
 @app.route('/api/status')
 def api_status():
+    # ?run=seed123 -> outputs/training_log_seed123.json (adim08_egitim.py --tag ile eslesir)
+    # ?run verilmezse: en son GUNCELLENEN log otomatik secilir (aktif egitim neyse o).
+    run_tag = request.args.get('run', '').strip()
+    if run_tag:
+        # Guvenlik: dosya adina sadece alfanumerik/altcizgi izin ver (path traversal onleme)
+        safe_tag = "".join(c for c in run_tag if c.isalnum() or c == '_')
+        log_path = os.path.join(config.OUTPUT_DIR, f"training_log_{safe_tag}.json")
+        active_tag = safe_tag
+    else:
+        log_path, active_tag = find_latest_log()
     try:
-        if os.path.exists(LOG_PATH):
-            with open(LOG_PATH, 'r', encoding='utf-8') as f:
+        if os.path.exists(log_path):
+            with open(log_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            data["_active_run"] = active_tag  # frontend'de gosterilir
             return jsonify(data)
         else:
-            return jsonify({"status": "waiting", "epochs": [], "total_epochs": 0})
+            return jsonify({"status": "waiting", "epochs": [], "total_epochs": 0, "_active_run": active_tag})
     except Exception:
-        return jsonify({"status": "waiting", "epochs": [], "total_epochs": 0})
+        return jsonify({"status": "waiting", "epochs": [], "total_epochs": 0, "_active_run": active_tag})
 
 
 def dashboard_baslat(port=5000):

@@ -32,7 +32,9 @@ DOMAIN_MAP = {
     "cpsc_2018_extra": 1,
     "ptb_xl": 2,
     "georgia": 3,
-    "ecg_arrhythmia": 4
+    "ecg_arrhythmia": 4,
+    "st_petersburg_incart": 5,
+    "records": 6,
 }
 
 def veri_bolme_pipeline():
@@ -40,13 +42,17 @@ def veri_bolme_pipeline():
     print("BirunAI — Adim 6: Veri Bolme ve Domain Atamasi (Multi-Dataset)")
     print("=" * 70)
 
-    # 1. Manifest Okunuyor (adim00 ve adim02'den uretilen filtrelenmis manifest)
-    manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "filtered_manifest.csv")
+    # 1. Manifest Okunuyor — TUM VERI kullanilacak (dengeleme ATLANIR)
+    # Oncelik: segmented -> filtered -> unified (balanced ATLANIR!)
+    manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "segmented_manifest.csv")
     if not os.path.exists(manifest_yolu):
-        print(f"[UYARI] {manifest_yolu} bulunamadi, fallback olarak unified_manifest.csv deneniyor...")
+        print(f"[BILGI] segmented_manifest.csv bulunamadi, filtered_manifest.csv deneniyor...")
+        manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "filtered_manifest.csv")
+    if not os.path.exists(manifest_yolu):
         manifest_yolu = os.path.join(config.PROCESSED_DATA_DIR, "unified_manifest.csv")
         
-    df = pd.read_csv(manifest_yolu)
+    df = pd.read_csv(manifest_yolu, low_memory=False)
+    print(f"Kaynak manifest: {os.path.basename(manifest_yolu)} (TUM VERI — dengeleme atlanmis)")
     
     # Eger 'filtered' sutunu varsa ve bazi kayitlar filtreden gecemediyse onlari cikar
     if 'filtered' in df.columns:

@@ -2,15 +2,18 @@
 adim00_veri_birlestirme.py — BirunAI EKG Siniflandirma: Adim 0 – Veri Birlestirme
 ===================================================================================
 
-Bu modul, 5 farkli veri setini tarar, SNOMED-CT kodlarini 3 sinifa esler
+Bu modul, 6+ farkli veri setini tarar, SNOMED-CT/AHA kodlarini 5 sinifa esler
 ve tek bir unified_manifest.csv dosyasi uretir.
 
 Veri Setleri:
-    1. CPSC 2018          — 6,877 kayit
-    2. CPSC 2018 Extra    — 3,453 kayit
-    3. PTB-XL (Challenge) — 21,837 kayit
-    4. Georgia             — 10,344 kayit
-    5. ECG Arrhythmia      — 45,152 kayit (Chapman-Shaoxing/Ningbo)
+    1. TEKNOFEST 2026     — Lise veri seti
+    2. CPSC 2018          — 6,877 kayit
+    3. CPSC 2018 Extra    — 3,453 kayit
+    4. PTB-XL (Challenge) — 21,837 kayit
+    5. Georgia             — 10,344 kayit
+    6. St Petersburg INCART — ~175 kayit
+    7. ECG Arrhythmia      — 45,152 kayit (Chapman-Shaoxing/Ningbo)
+    8. Records (H5+AHA)    — 25,770 kayit (Ritim bozuklugu agirliklari)
 
 Islem Akisi:
     1. Her veri seti dizinindeki .hea dosyalari taranir
@@ -265,6 +268,103 @@ def scan_teknofest(dataset_root):
     return records
 
 
+def aha_to_label(aha_code_str):
+    """
+    AHA kodlarindan 5-sinifli etikete donusturur.
+    
+    Cakisma mantigi (SNOMED ile ayni):
+        Oncelik: Iletim (3,4) > Ritim (1,2) > Normal (0)
+    
+    Args:
+        aha_code_str: str — ";" ile ayrilmis AHA kodlari (orn: "22;23")
+    
+    Returns:
+        int or None: 0-4 veya None (eslenemezse)
+    """
+    if not aha_code_str or pd.isna(aha_code_str):
+        return None
+    
+    bulunan_etiketler = set()
+    
+    for code_part in str(aha_code_str).split(';'):
+        code_part = code_part.strip()
+        # Kombine kodlari ayristir: "50+346" -> sadece 50'yi al
+        base_code = code_part.split('+')[0].strip()
+        try:
+            code_int = int(base_code)
+            if code_int in config.AHA_TO_LABEL:
+                bulunan_etiketler.add(config.AHA_TO_LABEL[code_int])
+        except ValueError:
+            continue
+    
+    if not bulunan_etiketler:
+        return None
+    
+    # Cakisma onceligi: Iletim (3,4) > Ritim (1,2) > Normal (0)
+    return max(bulunan_etiketler, key=lambda x: config.LABEL_PRIORITY.get(x, 0))
+
+
+def scan_records_dataset():
+    """
+    Records veri setini tarar (H5 format, AHA kodlari).
+    metadata CSV'den AHA kodlarini okur ve 5 sinifa esler.
+    
+    Returns:
+        list[dict]: Her kayit icin bir dict listesi
+    """
+    metadata_path = config.RECORDS_METADATA_CSV
+    dataset_dir = config.RECORDS_DATASET_DIR
+    
+    if not os.path.exists(metadata_path):
+        print(f"  [UYARI] Records metadata bulunamadi: {metadata_path}")
+        return []
+    
+    df = pd.read_csv(metadata_path)
+    records = []
+    eslenmayan_kodlar = set()
+    
+    for _, row in tqdm(df.iterrows(), desc=f"  {'Records (H5)':18s}", total=len(df), ncols=80):
+        ecg_id_raw = str(row['ECG_ID'])
+        h5_path = os.path.join(dataset_dir, f"{ecg_id_raw}.h5")
+        
+        if not os.path.exists(h5_path):
+            continue
+        
+        # AHA -> 5 sinif
+        label = aha_to_label(row['AHA_Code'])
+        
+        # Eslenmayan kodlari takip et
+        for code_part in str(row['AHA_Code']).split(';'):
+            base_code = code_part.strip().split('+')[0].strip()
+            try:
+                code_int = int(base_code)
+                if code_int not in config.AHA_TO_LABEL:
+                    eslenmayan_kodlar.add(code_int)
+            except ValueError:
+                pass
+        
+        ecg_id = f"records_{ecg_id_raw}"
+        
+        records.append({
+            'ecg_id': ecg_id,
+            'dataset_source': 'records',
+            'signal_path': h5_path,  # H5 dosyasinin tam yolu
+            'label': label,
+            'original_fs': 500,  # Records dataseti 500 Hz
+            'num_samples': int(row['N']),
+            'num_leads': 12,
+            'age': str(row.get('Age', 'Unknown')),
+            'sex': str(row.get('Sex', 'Unknown')),
+            'dx_codes': str(row['AHA_Code']),
+        })
+    
+    if eslenmayan_kodlar:
+        print(f"    Eslenmayan AHA kodlari ({len(eslenmayan_kodlar)}): "
+              f"{sorted(eslenmayan_kodlar)[:10]}...")
+    
+    return records
+
+
 # =============================================================================
 # ANA BIRLESTIRME PIPELINE'I
 # =============================================================================
@@ -282,7 +382,7 @@ def birlestirme_pipeline():
 
     # --- 1. Veri setlerini tara ---
     print(f"\n[1/3] Veri setleri taraniyor...")
-    print(f"      Toplam {len(config.DATASET_PATHS) + 1} veri seti\n")
+    print(f"      Toplam {len(config.DATASET_PATHS) + 2} veri seti\n")  # +2: TEKNOFEST + Records
 
     tum_kayitlar = []
 
@@ -290,11 +390,16 @@ def birlestirme_pipeline():
     tekno_kayitlar = scan_teknofest(config.TEKNOFEST_DIR)
     tum_kayitlar.extend(tekno_kayitlar)
 
-    # Internet Verileri (PhysioNet Challenge vb.)
+    # Internet Verileri (PhysioNet Challenge vb. — SNOMED-CT kodlari)
     for ds_name, ds_path in config.DATASET_PATHS.items():
         kayitlar = scan_dataset(ds_name, ds_path)
         print(f"    -> {ds_name}: {len(kayitlar)} kayit")
         tum_kayitlar.extend(kayitlar)
+
+    # Records Veri Seti (H5 format, AHA kodlari)
+    records_kayitlar = scan_records_dataset()
+    print(f"    -> records (H5): {len(records_kayitlar)} kayit")
+    tum_kayitlar.extend(records_kayitlar)
 
     print(f"\n      Toplam taranan: {len(tum_kayitlar)} kayit")
 

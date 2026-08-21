@@ -25,6 +25,7 @@ import sys
 import numpy as np
 import pandas as pd
 import wfdb
+import h5py
 from scipy.signal import butter, filtfilt, resample
 from tqdm import tqdm
 
@@ -139,18 +140,22 @@ def filtreleme_pipeline():
         signal_path = row['signal_path']
 
         try:
-            # Sinyal oku (wfdb tum formatlari destekler: .mat/.hea, .dat/.hea)
-            rec = wfdb.rdsamp(signal_path)
-            sinyal = rec[0]  # (zaman_adimi, kanal_sayisi)
-            meta = rec[1]
-
-            # Transpoz: (kanal_sayisi, zaman_adimi) formatina cevir
-            sinyal = sinyal.T  # (12, N)
-
-            # Orijinal Fs
-            orijinal_fs = meta.get('fs', row.get('original_fs', config.ORIGINAL_FS))
-            if orijinal_fs is None:
-                orijinal_fs = config.ORIGINAL_FS
+            signal_path = row['signal_path']
+            
+            # H5 dosyalari icin (records dataseti)
+            if str(signal_path).endswith('.h5'):
+                with h5py.File(signal_path, 'r') as f:
+                    sinyal = f['ecg'][:].astype(np.float32)  # (12, N) — zaten dogru format
+                orijinal_fs = 500  # Records dataseti 500 Hz
+            else:
+                # WFDB formati (.mat/.hea, .dat/.hea)
+                rec = wfdb.rdsamp(signal_path)
+                sinyal = rec[0]  # (zaman_adimi, kanal_sayisi)
+                meta = rec[1]
+                sinyal = sinyal.T  # (12, N) formatina cevir
+                orijinal_fs = meta.get('fs', row.get('original_fs', config.ORIGINAL_FS))
+                if orijinal_fs is None:
+                    orijinal_fs = config.ORIGINAL_FS
 
             # Alt ornekleme: 500 Hz -> 250 Hz
 

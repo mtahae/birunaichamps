@@ -51,12 +51,17 @@ _ECGARR_ROOT = os.path.join(
 )
 
 DATASET_PATHS = {
-    "cpsc_2018":       os.path.join(_CH2020_ROOT, "cpsc_2018"),
-    "cpsc_2018_extra": os.path.join(_CH2020_ROOT, "cpsc_2018_extra"),
-    "ptb_xl":          os.path.join(_CH2020_ROOT, "ptb-xl"),
-    "georgia":         os.path.join(_CH2020_ROOT, "georgia"),
-    "ecg_arrhythmia":  _ECGARR_ROOT,
+    "cpsc_2018":            os.path.join(_CH2020_ROOT, "cpsc_2018"),
+    "cpsc_2018_extra":      os.path.join(_CH2020_ROOT, "cpsc_2018_extra"),
+    "ptb_xl":               os.path.join(_CH2020_ROOT, "ptb-xl"),
+    "georgia":              os.path.join(_CH2020_ROOT, "georgia"),
+    "st_petersburg_incart": os.path.join(_CH2020_ROOT, "st_petersburg_incart"),
+    "ecg_arrhythmia":       _ECGARR_ROOT,
 }
+
+# Records Dataset (H5 formati, AHA kodlari)
+RECORDS_DATASET_DIR = os.path.join(DATASETS_ROOT, "records", "records")
+RECORDS_METADATA_CSV = os.path.join(RECORDS_DATASET_DIR, "metadata (1).csv")
 
 # Cikti dizinleri
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
@@ -144,6 +149,26 @@ SNOMED_TO_LABEL = {
     713426002: 4,
 }
 
+# AHA kod esleme tablosu (records dataseti icin)
+# AHA diagnostic kodlari -> 5 sinif
+AHA_TO_LABEL = {
+    # Normal Sinus Rhythm
+    1: 0,
+
+    # AFIB (Atrial Fibrillation)
+    22: 1,
+
+    # AFL (Atrial Flutter)
+    23: 2,
+
+    # LBBB (Left Bundle Branch Block)
+    50: 3,   # Complete LBBB
+    51: 3,   # Incomplete LBBB
+
+    # RBBB (Right Bundle Branch Block)
+    60: 4,   # Complete RBBB
+}
+
 # =============================================================================
 # MODEL MIMARISI PARAMETRELERI (CardioFusion-5)
 # =============================================================================
@@ -159,28 +184,42 @@ TRANSFORMER_DIM = 384
 TRANSFORMER_DROPOUT = 0.2
 
 # Wide Features
-WIDE_FEATURE_DIM = 8
+WIDE_FEATURE_DIM = 12  # 8 + 4 P-dalga ozelligi (rr_cv, p_present, p_regularity, atrial_rate)
 
 # =============================================================================
 # EGITIM PARAMETRELERI — PDF BOLUM 3.3 (Curriculum Learning)
 # =============================================================================
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 5e-4  # Overfitting onleme: 1e-4 -> 5e-4
+WEIGHT_DECAY = 1.2e-3  # Overfitting onleme: 5e-4 -> 1.2e-3 (train/val makasi 0.11'di)
 NUM_EPOCHS = 100
 
-# Curriculum Learning Asamalari — PDF: Epoch 1-20, 21-80, 81-100
-EPOCHS_PHASE_1 = 20   # Sadece Teknofest
-EPOCHS_PHASE_2 = 60   # Teknofest + Internet (DANN aktif)
-EPOCHS_PHASE_3 = 20   # Teknofest Fine-tune (LR 10x dusuk)
+# Curriculum Learning Asamalari
+# REVIZE 2 (2026-07-19): Iki ayri run'da (seed42, seed123) P2'nin val-loss/F1 zirvesi
+# HER IKISINDE de P2'nin ilk ~9 epoch'unda geliyor, sonrasi TUTARLI sekilde overfit
+# (val loss 0.225->0.440'a katlaniyor). P2=30+patience=12 bu zirveyi epoch 21'de
+# yakaliyor ama epoch 10-21 arasi (11 epoch, ~%35 P2 suresi) tamamen bosa gidiyor.
+# P2 kisaltildi (30->18) + PATIENCE_P2 dusuruldu (bkz adim08_egitim.py) — sonuc
+# degismez (checkpoint zaten zirveyi kurtariyordu), sadece wall-clock kazanilir.
+EPOCHS_PHASE_1 = 25   # Sadece Teknofest (uretken faz — biraz daha alan)
+EPOCHS_PHASE_2 = 18   # Teknofest + Internet (DANN aktif) — zirve ~epoch9'da, guvenli marj
+EPOCHS_PHASE_3 = 25   # Fine-tune (dusuk LR, TEKNOFEST) — erken ve yeterli ince ayar
 
-# DANN
-DANN_LAMBDA = 0.1
+# DANN — domain overfit'e karsi guclendirildi (md: 0.1 -> 0.3)
+DANN_LAMBDA = 0.3
+
+# GURULTULU-ETIKET-FARKINDA AGIRLIKLANDIRMA (AFIB/AFL darbogazi icin)
+# Kanit: 4 mimari iterasyonda AFIB/AFL kimildamadi -> sorun VERI/ETIKET.
+# Internet ritim etiketleri (AFIB/AFL) gurultulu ve TEKNOFEST ile celisiyor.
+# P2'de internet (domain>0) AFIB/AFL ornekleri loss'a bu kat katki yapar (<1.0),
+# boylece ritim ogrenimi TEMIZ TEKNOFEST etiketlerinden baskin sekilde gelir.
+# Morfoloji siniflari (Normal/LBBB/RBBB) internet verisinin tamamini kullanir.
+INTERNET_RHYTHM_WEIGHT = 0.4
 
 # Loss Hyperparametreleri — PDF BOLUM 6
 FOCAL_LOSS_GAMMA = 2.0
 FOCAL_GAMMA = FOCAL_LOSS_GAMMA  # Alias (eski kod uyumlulugu)
-LABEL_SMOOTHING = 0.10  # Overfitting onleme: 0.05 -> 0.10
+LABEL_SMOOTHING = 0.03  # 0.05'ten dusuruldu — AFL/AFIB icin daha keskin kararlar
 AUX_LOSS_WEIGHT = 0.3  # Multi-Task: L = L_main + 0.3 * L_aux
 
 # Egitim Kontrolleri

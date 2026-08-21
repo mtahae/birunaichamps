@@ -1,0 +1,28 @@
+{
+  "checkpoints": [
+    "best_model_seed42.pth",
+    "best_model_seed123.pth",
+    "best_model_seed2026.pth"
+  ],
+  "per_model_f1": {
+    "best_model_seed42.pth": 0.8538737498110318,
+    "best_model_seed123.pth": 0.8600424904770853,
+    "best_model_seed2026.pth": 0.8672900876312241
+  },
+  "ensemble_argmax_f1": 0.8641613462063826,
+  "ensemble_threshold_f1": 0.8736158840679428,
+  "thresholds": [
+    0.34,
+    0.42,
+    0.5,
+    0.3,
+    0.55
+  ],
+  "class_names": [
+    "Normal",
+    "AFIB",
+    "AFL",
+    "LBBB",
+    "RBBB"
+  ]
+}

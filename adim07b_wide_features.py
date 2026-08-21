@@ -33,7 +33,7 @@ import config
 
 def extract_wide_features_fast(sinyal, age=50.0, gender=0.5, fs=250):
     """
-    Hizli wide feature cikarimi (neurokit2 yerine scipy kullanir).
+    Wide feature cikarimi — 12 boyutlu (8 temel + 4 P-dalga ozelligi).
     
     Args:
         sinyal: (12, N) numpy array — filtrelenmis EKG sinyali
@@ -42,9 +42,23 @@ def extract_wide_features_fast(sinyal, age=50.0, gender=0.5, fs=250):
         fs: Ornekleme frekansi
     
     Returns:
-        (8,) float32 numpy array
+        (12,) float32 numpy array
+        
+    Features:
+        0: Mean HR      — Ortalama kalp hizi
+        1: HR Std       — Kalp hizi standart sapmasi  
+        2: Mean RR      — Ortalama RR araligi
+        3: RR Std       — RR duzensizligi
+        4: NN50         — >50ms farkli ardisik RR sayisi
+        5: pNN50        — NN50 / toplam RR orani
+        6: Age          — Yas (normalize)
+        7: Gender       — Cinsiyet
+        8: RR CV        — RR coefficient of variation (AFIB'de yuksek)
+        9: P Present    — P dalgasi varlik orani (AFIB'de dusuk)
+        10: P Regularity — P dalgasi duzenliligi (AFL'de duzensiz flutter)
+        11: Atrial Rate  — Atrial hiz tahmini (AFL'de 250-350 bpm)
     """
-    features = np.zeros(8, dtype=np.float32)
+    features = np.zeros(12, dtype=np.float32)
     
     # Age ve Gender
     features[6] = min(age / 100.0, 1.0)
@@ -77,13 +91,64 @@ def extract_wide_features_fast(sinyal, age=50.0, gender=0.5, fs=250):
             nn50 = np.sum(rr_diffs > 50)
             pnn50 = nn50 / len(rr_intervals) if len(rr_intervals) > 0 else 0.0
             
-            # Normalize ve ata
-            features[0] = min(mean_hr / 200.0, 1.0)      # Max 200 bpm
-            features[1] = min(std_hr / 50.0, 1.0)         # Max 50 bpm std
-            features[2] = min(mean_rr / 1500.0, 1.0)      # Max 1500ms
-            features[3] = min(std_rr / 300.0, 1.0)        # Max 300ms std
-            features[4] = min(nn50 / 30.0, 1.0)           # Max 30
+            # Temel ozellikler (0-7)
+            features[0] = min(mean_hr / 200.0, 1.0)
+            features[1] = min(std_hr / 50.0, 1.0)
+            features[2] = min(mean_rr / 1500.0, 1.0)
+            features[3] = min(std_rr / 300.0, 1.0)
+            features[4] = min(nn50 / 30.0, 1.0)
             features[5] = min(pnn50, 1.0)
+            
+            # === YENi: P-dalga ozellikleri (8-11) ===
+            
+            # 8. RR CV (Coefficient of Variation) — AFIB'de cok yuksek
+            rr_cv = std_rr / (mean_rr + 1e-6)
+            features[8] = min(rr_cv / 0.5, 1.0)  # Max 0.5 CV
+            
+            # 9. P-Present — P dalgasi var mi? (R-pike oncesi 200ms pencere)
+            # AFIB'de P dalgasi YOKTUR, Normal'de VARDIR
+            p_count = 0
+            for r_idx in peaks[1:]:  # Ilk pike'i atla
+                p_start = max(0, r_idx - int(0.3 * fs))
+                p_end = max(0, r_idx - int(0.05 * fs))
+                if p_end > p_start:
+                    p_segment = lead_ii[p_start:p_end]
+                    if len(p_segment) > 5:
+                        # P dalgasi var mi? Basit enerji kontrolu
+                        p_energy = np.std(p_segment)
+                        baseline_energy = np.std(lead_ii) * 0.15
+                        if p_energy > baseline_energy:
+                            p_count += 1
+            features[9] = p_count / max(len(peaks) - 1, 1)  # P present ratio
+            
+            # 10. P Regularity — P dalgasi duzenliligi
+            # AFL'de testere disi (cok duzenli), AFIB'de kaotik
+            if len(peaks) >= 4:
+                p_intervals = []
+                for i in range(1, len(peaks)):
+                    p_start = max(0, peaks[i] - int(0.3 * fs))
+                    p_end = max(0, peaks[i] - int(0.05 * fs))
+                    if p_end > p_start:
+                        p_segment = lead_ii[p_start:p_end]
+                        if len(p_segment) > 5:
+                            p_intervals.append(np.std(p_segment))
+                if len(p_intervals) >= 3:
+                    p_reg = 1.0 - min(np.std(p_intervals) / (np.mean(p_intervals) + 1e-6), 1.0)
+                    features[10] = p_reg
+            
+            # 11. Atrial Rate — AFL'de 250-350 bpm (testere disi frekansi)
+            # Yuksek frekansi (4-8 Hz = 240-480 bpm) tespit et
+            from scipy.signal import welch
+            try:
+                f, psd = welch(lead_ii, fs=fs, nperseg=min(256, len(lead_ii)))
+                # 4-8 Hz bandindaki guc (AFL flutter frekansi)
+                flutter_mask = (f >= 4) & (f <= 8)
+                total_mask = (f >= 0.5) & (f <= 40)
+                flutter_power = np.sum(psd[flutter_mask])
+                total_power = np.sum(psd[total_mask]) + 1e-6
+                features[11] = min(flutter_power / total_power, 1.0)
+            except Exception:
+                features[11] = 0.0
             
     except Exception:
         pass  # Hata durumunda 0'lar kalir
@@ -99,7 +164,7 @@ def _process_one(args):
         feats = extract_wide_features_fast(sinyal, age=age, gender=gender, fs=fs)
         return ecg_id, feats, None
     except Exception as e:
-        return ecg_id, np.zeros(8, dtype=np.float32), str(e)
+        return ecg_id, np.zeros(12, dtype=np.float32), str(e)
 
 
 def wide_features_pipeline():
